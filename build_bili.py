@@ -1584,17 +1584,6 @@ var style_0 = { "_": {
     "color": "#ffffff",
     "fontWeight": "bold"
   },
-  "btn-stop": {
-    "backgroundColor": "#22252c",
-    "borderRadius": "4px",
-    "height": "24px",
-    "justifyContent": "center",
-    "alignItems": "center"
-  },
-  "btn-stop-text": {
-    "color": "#ff5555",
-    "fontSize": "10px"
-  },
   "content-panel": {
     "width": "545px",
     "height": "172px",
@@ -2230,12 +2219,6 @@ var render = function () {
             on: { "click": function () { _vm.switchTab('login'); } }
           }, [_vm._v(_vm.isLoggedIn ? '我的' : '登录')])
         ])
-      ]),
-      _c('div', {
-        staticClass: ["btn-stop"],
-        on: { "click": _vm.stop }
-      }, [
-        _c('text', { staticClass: ["btn-stop-text"] }, [_vm._v("停止播放")])
       ])
     ]),
 
@@ -2556,7 +2539,7 @@ App$1.meta = {
   }
 };
 App$1.meta.name = '笔上哔哩';
-App$1.meta.version = '2.4.0';
+App$1.meta.version = '2.4.1';
 App$1.meta.isSingleJsBundle = false;
 $falcon.__AppClazz = App$1;
 $falcon.__loadModuleDefault = async function (fileName) {
@@ -2582,7 +2565,7 @@ with open(os.path.join(PKG_DIR, "app.js"), "w", encoding="utf-8") as f:
 # 4. Manifest template
 manifest = {
     "appName": "笔上哔哩",
-    "version": "2.4.0",
+    "version": "2.4.1",
     "appid": "9002000869905604",
     "icon": "app_icon.png",
     "quickjs": {
