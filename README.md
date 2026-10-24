@@ -35,6 +35,8 @@ adb shell "miniapp_cli start 9002000869905604"
 
 ## 构建
 
+前置：Python 3、Go 1.22+（用于编译 daemon）。
+
 - **前端 / 打包**：`python build_bili.py`（生成 `9002000869905604.amr`，自动编译 Go daemon 并重算 manifest 证书）
 - **daemon**：`bili_src/main.go`（Go，交叉编译到 linux/arm）
 - **native 模块**：`native/rgavideo.c`；预编译的 `libjsapi_rgavideo.so` 已随仓库提供，重新编译需要 Rockchip `arm-rockchip830-linux-uclibcgnueabihf` 工具链与设备 FFmpeg 4.4.1 库
