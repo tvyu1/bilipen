@@ -33,15 +33,30 @@ typedef struct {
     int out_w, out_h;
     uint8_t *jsbuf;
     size_t jsbuf_size;
-    uint8_t *back;
-    size_t back_size;
+    /* 3 帧环形缓冲：解码线程可以比 JS 渲染线程领先 1~2 帧，
+     * 吸收主线程抖动（GC/音频回调/系统调度），避免单缓冲下周期性丢帧造成卡顿。 */
+    uint8_t *ring[3];
+    size_t slot_size;
+    int ring_head;   /* 生产者下次写入位置 */
+    int ring_count;  /* 已填充帧数（消费者取走时减少） */
 
     pthread_t th;
     pthread_mutex_t mu;
     int thread_started;
     volatile int stop_flag;
-    volatile int have_frame;
     volatile int finished;
+    volatile int sync_ready;   /* 首帧已就绪且 JS 已放行：readFrame 才开始出帧 */
+    volatile int resume_req;   /* JS 调用了 resume()（只表示请求放行，不等同于首帧就绪） */
+    double resume_offset;      /* 起播时跳过视频内容的前 N 秒，用于对齐已在播放的音频 */
+    volatile int paused;       /* 暂停：解码线程原地等待，readFrame 不出帧 */
+    volatile int unpause_req;  /* 恢复：把暂停时长补偿给播放时间轴 */
+    double unpause_delta;
+    double pause_started;
+    volatile int adj_req;      /* JS 请求动态校正（音频位置追帧） */
+    double adj_delta;          /* >0 视频内容需要前进(跳帧)，<0 需要等待 */
+    double skip_until;         /* 跳帧目标内容时间（秒） */
+    volatile int primed;       /* 首帧已解码进 back buffer */
+    double last_t0_reset;      /* 追帧自愈：最近一次重置 t0 的时刻 */
 
     int src_w, src_h;
     double duration;
@@ -59,6 +74,21 @@ static double now_sec(void) {
 
 static void set_err(RgaPlayer *p, const char *fmt, int code) {
     snprintf(p->err, sizeof(p->err), fmt, code);
+}
+
+/* 把一帧 YUV 转 BGRA 后放入环形缓冲（满则丢弃该帧，保持节奏）。 */
+static void push_frame(RgaPlayer *p, struct SwsContext *sws, const AVFrame *frm, double pts) {
+    pthread_mutex_lock(&p->mu);
+    if (p->ring_count < 3) {
+        uint8_t *dst[4] = { p->ring[p->ring_head], NULL, NULL, NULL };
+        int dst_stride[4] = { p->out_w * 4, 0, 0, 0 };
+        sws_scale(sws, (const uint8_t *const *)frm->data, frm->linesize,
+                  0, p->src_h, dst, dst_stride);
+        p->ring_head = (p->ring_head + 1) % 3;
+        p->ring_count++;
+    }
+    p->position = pts;
+    pthread_mutex_unlock(&p->mu);
 }
 
 static void *decode_main(void *arg) {
@@ -111,7 +141,7 @@ static void *decode_main(void *arg) {
     pkt = av_packet_alloc();
     frm = av_frame_alloc();
     sws = sws_getContext(p->src_w, p->src_h, dec->pix_fmt,
-                         p->out_w, p->out_h, AV_PIX_FMT_RGBA,
+                         p->out_w, p->out_h, AV_PIX_FMT_BGRA,
                          SWS_FAST_BILINEAR, NULL, NULL, NULL);
     if (!pkt || !frm || !sws) {
         set_err(p, "alloc=%d", -3);
@@ -121,8 +151,15 @@ static void *decode_main(void *arg) {
     {
         AVRational tb = fmt->streams[vst]->time_base;
         int64_t start_ts = AV_NOPTS_VALUE;
-        double t0 = now_sec();
+        double t0 = 0.0;
         while (!p->stop_flag) {
+            /* 暂停：解码线程原地等待（不读流、不推进时间轴）。 */
+            while (p->paused && !p->stop_flag) {
+                usleep(5000);
+            }
+            if (p->stop_flag) {
+                break;
+            }
             ret = av_read_frame(fmt, pkt);
             if (ret < 0) {
                 break;
@@ -146,9 +183,74 @@ static void *decode_main(void *arg) {
                         pts = (double)(ts - start_ts) * av_q2d(tb);
                     }
                 }
+                /* 同步门控：首帧必须先解码进 back buffer 并等到 JS 的 resume() 请求，
+                 * 再以「此刻」作为内容 0 点开始按 PTS 播放，实现音视频 0 点对齐。
+                 * 注意：JS 的 resume 可能先于首帧到达，所以这里只看 primed，不看 sync_ready。 */
+                if (!p->primed) {
+                    push_frame(p, sws, frm, pts);
+                    p->primed = 1;
+                    {
+                        double waited = 0.0;
+                        while (!p->resume_req && !p->stop_flag && waited < 4.0) {
+                            usleep(2000);
+                            waited += 0.002;
+                        }
+                    }
+                    if (p->stop_flag) {
+                        av_frame_unref(frm);
+                        break;
+                    }
+                    p->sync_ready = 1;
+                    t0 = now_sec() - pts - p->resume_offset;
+                    p->last_t0_reset = now_sec();
+                    av_frame_unref(frm);
+                    continue;
+                }
+                /* 恢复播放：把暂停的时长补回时间轴，内容从中断处继续。 */
+                if (p->unpause_req) {
+                    p->unpause_req = 0;
+                    t0 += p->unpause_delta;
+                    p->last_t0_reset = now_sec();
+                }
+                /* 动态对齐：JS 用音频播放位置与视频内容位置比较后调用 adjust(delta)。
+                 * delta>0 表示音频更靠前，视频需要跳过 delta 秒内容追上去；delta<0 表示视频要等一等。 */
+                if (p->adj_req) {
+                    double d = p->adj_delta;
+                    p->adj_req = 0;
+                    if (d > 1.0) d = 1.0;
+                    if (d < -1.0) d = -1.0;
+                    if (d > 0.02) {
+                        p->skip_until = p->position + d;
+                        t0 -= d;
+                    } else if (d < -0.02) {
+                        t0 += (-d);
+                    }
+                    p->last_t0_reset = now_sec();
+                }
+                if (p->skip_until > 0.0) {
+                    if (pts < p->skip_until - 1e-6) {
+                        p->position = pts;
+                        av_frame_unref(frm);
+                        continue;
+                    }
+                    p->skip_until = 0.0;
+                }
+                /* 内容时间落后超过 80ms：丢弃该帧（不做 RGBA 转换、不显示），快速追回实时；
+                 * 否则 30fps 内容在渲染节奏不匹配时会持续落后，表现为音频越来越超前。 */
                 {
-                    double target = t0 + pts;
                     double now = now_sec();
+                    double target = t0 + pts;
+                    if (now - target > 0.08) {
+                        /* 自愈兜底：异常情况下若持续落后超过 1.5s（如 t0 建立时机异常），
+                         * 把内容 0 点重置到现在，避免永久黑屏只出音频。 */
+                        if (now - p->last_t0_reset > 1.5) {
+                            t0 = now - pts;
+                            p->last_t0_reset = now;
+                        }
+                        p->position = pts;
+                        av_frame_unref(frm);
+                        continue;
+                    }
                     if (target > now + 0.001) {
                         double d = target - now;
                         struct timespec sl;
@@ -157,10 +259,14 @@ static void *decode_main(void *arg) {
                         nanosleep(&sl, NULL);
                     }
                 }
-                /* 消费者还没取走上一帧时等一等（最多 ~40ms，超时则丢帧保节奏） */
+                /* 环形缓冲已满（渲染端落后）时等一等，最多 ~40ms；仍满则由 push_frame 丢帧保节奏。 */
                 {
                     int wait_ms = 0;
-                    while (p->have_frame && !p->stop_flag && wait_ms < 40) {
+                    while (!p->stop_flag && wait_ms < 40) {
+                        pthread_mutex_lock(&p->mu);
+                        int full = p->ring_count >= 3;
+                        pthread_mutex_unlock(&p->mu);
+                        if (!full) break;
                         usleep(2000);
                         wait_ms += 2;
                     }
@@ -169,16 +275,7 @@ static void *decode_main(void *arg) {
                     av_frame_unref(frm);
                     break;
                 }
-                pthread_mutex_lock(&p->mu);
-                {
-                    uint8_t *dst[4] = { p->back, NULL, NULL, NULL };
-                    int dst_stride[4] = { p->out_w * 4, 0, 0, 0 };
-                    sws_scale(sws, (const uint8_t *const *)frm->data, frm->linesize,
-                              0, p->src_h, dst, dst_stride);
-                    p->have_frame = 1;
-                    p->position = pts;
-                }
-                pthread_mutex_unlock(&p->mu);
+                push_frame(p, sws, frm, pts);
                 av_frame_unref(frm);
             }
         }
@@ -199,15 +296,20 @@ done:
 
 static void player_stop(RgaPlayer *p) {
     p->stop_flag = 1;
+    p->sync_ready = 1; /* 释放可能正在等待 resume 的解码线程 */
+    p->resume_req = 1;
     if (p->thread_started) {
         pthread_join(p->th, NULL);
         p->thread_started = 0;
     }
     pthread_mutex_lock(&p->mu);
-    free(p->back);
-    p->back = NULL;
-    p->back_size = 0;
-    p->have_frame = 0;
+    for (int i = 0; i < 3; i++) {
+        free(p->ring[i]);
+        p->ring[i] = NULL;
+    }
+    p->slot_size = 0;
+    p->ring_head = 0;
+    p->ring_count = 0;
     pthread_mutex_unlock(&p->mu);
     if (p->url) {
         free(p->url);
@@ -264,14 +366,34 @@ static JSValue js_start(JSContext *ctx, JSValueConst this_val, int argc, JSValue
         g.out_w = 640;
         g.out_h = 360;
     }
-    g.back_size = (size_t)g.out_w * (size_t)g.out_h * 4;
-    g.back = (uint8_t *)malloc(g.back_size);
-    if (!g.back) {
-        return JS_ThrowTypeError(ctx, "oom back");
+    g.slot_size = (size_t)g.out_w * (size_t)g.out_h * 4;
+    for (int i = 0; i < 3; i++) {
+        g.ring[i] = (uint8_t *)malloc(g.slot_size);
+        if (!g.ring[i]) {
+            for (int j = 0; j < i; j++) {
+                free(g.ring[j]);
+                g.ring[j] = NULL;
+            }
+            g.slot_size = 0;
+            return JS_ThrowTypeError(ctx, "oom ring");
+        }
     }
+    g.ring_head = 0;
+    g.ring_count = 0;
     g.stop_flag = 0;
-    g.have_frame = 0;
     g.finished = 0;
+    g.sync_ready = 0;
+    g.primed = 0;
+    g.resume_req = 0;
+    g.resume_offset = 0;
+    g.adj_req = 0;
+    g.adj_delta = 0.0;
+    g.skip_until = 0.0;
+    g.paused = 0;
+    g.unpause_req = 0;
+    g.unpause_delta = 0.0;
+    g.pause_started = 0.0;
+    g.last_t0_reset = now_sec();
     if (pthread_create(&g.th, NULL, decode_main, &g) != 0) {
         return JS_ThrowTypeError(ctx, "pthread_create failed");
     }
@@ -282,9 +404,10 @@ static JSValue js_start(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 static JSValue js_readFrame(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     int got = 0;
     pthread_mutex_lock(&g.mu);
-    if (g.have_frame && g.jsbuf && g.back && g.jsbuf_size >= g.back_size) {
-        memcpy(g.jsbuf, g.back, g.back_size);
-        g.have_frame = 0;
+    if (!g.paused && g.sync_ready && g.ring_count > 0 && g.jsbuf && g.jsbuf_size >= g.slot_size) {
+        int tail = (g.ring_head - g.ring_count + 3) % 3;
+        memcpy(g.jsbuf, g.ring[tail], g.slot_size);
+        g.ring_count--;
         got = 1;
     }
     pthread_mutex_unlock(&g.mu);
@@ -296,6 +419,53 @@ static JSValue js_stop(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
     return JS_NewInt32(ctx, 1);
 }
 
+static JSValue js_pause(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (!g.paused) {
+        g.paused = 1;
+        g.pause_started = now_sec();
+    }
+    return JS_NewInt32(ctx, 1);
+}
+
+static JSValue js_unpause(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    if (g.paused) {
+        g.paused = 0;
+        g.unpause_delta = now_sec() - g.pause_started;
+        g.unpause_req = 1;
+    }
+    return JS_NewInt32(ctx, 1);
+}
+
+/* JS 在音频位置回调时调用：放行视频。可选参数 offset（秒）= 视频内容需要跳过的开头长度，
+ * 用于对齐「已经开始播放的音频」与「从 0 开始的视频」。 */
+static JSValue js_resume(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    double off = 0.0;
+    if (argc >= 1) {
+        if (JS_ToFloat64(ctx, &off, argv[0]) != 0 || !(off >= 0.0) || off > 30.0) {
+            off = 0.0;
+        }
+    }
+    g.resume_offset = off;
+    /* 只记录「请求放行」；真正开播要等解码线程拿到首帧（primed），避免竞态导致黑屏。 */
+    g.resume_req = 1;
+    return JS_NewInt32(ctx, 1);
+}
+
+/* 动态对齐：JS 传入 delta 秒（音频位置 - 视频位置）。>0 视频跳帧追上音频，<0 视频等待音频。 */
+static JSValue js_adjust(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
+    double d = 0.0;
+    if (argc >= 1) {
+        if (JS_ToFloat64(ctx, &d, argv[0]) != 0) {
+            d = 0.0;
+        }
+    }
+    if (d > 2.0) d = 2.0;
+    if (d < -2.0) d = -2.0;
+    g.adj_delta = d;
+    g.adj_req = 1;
+    return JS_NewInt32(ctx, 1);
+}
+
 static JSValue js_info(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSValue obj = JS_NewObject(ctx);
     JS_SetPropertyStr(ctx, obj, "width", JS_NewInt32(ctx, g.src_w));
@@ -303,6 +473,7 @@ static JSValue js_info(JSContext *ctx, JSValueConst this_val, int argc, JSValueC
     JS_SetPropertyStr(ctx, obj, "duration", JS_NewFloat64(ctx, g.duration));
     JS_SetPropertyStr(ctx, obj, "position", JS_NewFloat64(ctx, g.position));
     JS_SetPropertyStr(ctx, obj, "finished", JS_NewInt32(ctx, g.finished));
+    JS_SetPropertyStr(ctx, obj, "primed", JS_NewInt32(ctx, g.primed));
     return obj;
 }
 
@@ -324,6 +495,10 @@ static int js_module_init(JSContext *ctx, JSModuleDef *m) {
     JS_SetPropertyStr(ctx, obj, "start", JS_NewCFunction2(ctx, js_start, "start", 1, JS_CFUNC_generic, 0));
     JS_SetPropertyStr(ctx, obj, "readFrame", JS_NewCFunction2(ctx, js_readFrame, "readFrame", 0, JS_CFUNC_generic, 0));
     JS_SetPropertyStr(ctx, obj, "stop", JS_NewCFunction2(ctx, js_stop, "stop", 0, JS_CFUNC_generic, 0));
+    JS_SetPropertyStr(ctx, obj, "pause", JS_NewCFunction2(ctx, js_pause, "pause", 0, JS_CFUNC_generic, 0));
+    JS_SetPropertyStr(ctx, obj, "unpause", JS_NewCFunction2(ctx, js_unpause, "unpause", 0, JS_CFUNC_generic, 0));
+    JS_SetPropertyStr(ctx, obj, "resume", JS_NewCFunction2(ctx, js_resume, "resume", 0, JS_CFUNC_generic, 0));
+    JS_SetPropertyStr(ctx, obj, "adjust", JS_NewCFunction2(ctx, js_adjust, "adjust", 0, JS_CFUNC_generic, 0));
     JS_SetPropertyStr(ctx, obj, "info", JS_NewCFunction2(ctx, js_info, "info", 0, JS_CFUNC_generic, 0));
     JS_SetPropertyStr(ctx, obj, "error", JS_NewCFunction2(ctx, js_error, "error", 0, JS_CFUNC_generic, 0));
     JS_SetPropertyStr(ctx, obj, "duration", JS_NewCFunction2(ctx, js_duration, "duration", 0, JS_CFUNC_generic, 0));

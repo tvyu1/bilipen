@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version     = "2.2.1"
+	Version     = "2.3.1"
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
 	UserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -46,6 +46,10 @@ const (
 	CacheCapBytes    = int64(600 << 20)
 	PrefetchMinBytes = int64(256 << 10)
 	PrefetchWaitMax  = 1500 * time.Millisecond
+	// Range 请求等待本地缓存的时长：spool 可能排队在其它下载后面（并发上限 2），
+	// 等太久会让视频流迟迟没有数据（表现为只有声音、画面黑几十秒）。
+	// 这里只短暂等待，拿不到就立即回退直连代理，spool 继续在后台补缓存。
+	SpoolRangeWaitMax = 2 * time.Second
 	// 播放中把后台预取限速到该速率，避免 HTTPS 解密+写盘与单核解码抢 CPU。
 	PrefetchPlayingRate = int64(512 << 10)
 	AudioIdleTimeout    = 30 * time.Second
@@ -293,8 +297,119 @@ func cacheCover(bvid, picUrl string) string {
 	return "covers/" + bvid + ".jpg"
 }
 
+// ---------------- 观看历史（持久化到 /userdisk/bili_history.json） ----------------
+
+const (
+	HistoryPath  = "/userdisk/bili_history.json"
+	HistoryLimit = 60
+)
+
+type HistoryItem struct {
+	Bvid     string  `json:"bvid"`
+	Title    string  `json:"title"`
+	Pic      string  `json:"pic"`
+	Position float64 `json:"position"`
+	Duration float64 `json:"duration"`
+	Updated  int64   `json:"updated"`
+}
+
+var (
+	historyMu    sync.Mutex
+	historyItems []HistoryItem
+)
+
+func loadHistory() {
+	b, err := os.ReadFile(HistoryPath)
+	if err != nil || len(b) == 0 {
+		return
+	}
+	_ = json.Unmarshal(b, &historyItems)
+}
+
+func saveHistoryLocked() {
+	b, err := json.Marshal(historyItems)
+	if err != nil {
+		return
+	}
+	tmp := HistoryPath + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err == nil {
+		_ = os.Rename(tmp, HistoryPath)
+	}
+}
+
+// handleHistoryAdd 记录/更新一条观看历史（同一 bvid 只保留一条，移到最前）。
+func handleHistoryAdd(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	bvid := q.Get("bvid")
+	if bvid == "" || !validBVID(bvid) {
+		http.Error(w, "bad bvid", 400)
+		return
+	}
+	title := q.Get("title")
+	pic := q.Get("pic")
+	pos, _ := strconv.ParseFloat(q.Get("position"), 64)
+	dur, _ := strconv.ParseFloat(q.Get("duration"), 64)
+	now := time.Now().Unix()
+
+	historyMu.Lock()
+	idx := -1
+	for i := range historyItems {
+		if historyItems[i].Bvid == bvid {
+			idx = i
+			break
+		}
+	}
+	var item HistoryItem
+	if idx >= 0 {
+		item = historyItems[idx]
+		historyItems = append(historyItems[:idx], historyItems[idx+1:]...)
+	}
+	item.Bvid = bvid
+	if title != "" {
+		item.Title = title
+	}
+	if pic != "" {
+		item.Pic = pic
+	}
+	if pos > 0 {
+		item.Position = pos
+	}
+	if dur > 0 {
+		item.Duration = dur
+	}
+	item.Updated = now
+	historyItems = append([]HistoryItem{item}, historyItems...)
+	if len(historyItems) > HistoryLimit {
+		historyItems = historyItems[:HistoryLimit]
+	}
+	saveHistoryLocked()
+	count := len(historyItems)
+	historyMu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"ok": true, "count": count})
+}
+
+func handleHistoryList(w http.ResponseWriter, r *http.Request) {
+	historyMu.Lock()
+	out := append([]HistoryItem{}, historyItems...)
+	historyMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"items": out})
+}
+
+func handleHistoryClear(w http.ResponseWriter, r *http.Request) {
+	historyMu.Lock()
+	historyItems = nil
+	saveHistoryLocked()
+	historyMu.Unlock()
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"ok":true}`))
+}
+
 func main() {
 	_ = os.MkdirAll(CoverDir, 0755)
+	loadHistory()
 	log.Printf("[BiliDaemon] Starting v%s on 127.0.0.1:%d ...", Version, Port)
 
 	go cleanCache()
@@ -315,6 +430,9 @@ func main() {
 	mux.HandleFunc("/api/detail", handleDetail)
 	mux.HandleFunc("/api/audio", handleAudio)
 	mux.HandleFunc("/api/metrics", handleMetrics)
+	mux.HandleFunc("/api/history", handleHistoryList)
+	mux.HandleFunc("/api/history/add", handleHistoryAdd)
+	mux.HandleFunc("/api/history/clear", handleHistoryClear)
 
 	// User & Login
 	mux.HandleFunc("/api/user/info", handleUserInfo)
@@ -1339,7 +1457,7 @@ func (s *spool) downloadOne(rawURL string) error {
 			s.have += int64(n)
 			s.cond.Broadcast()
 			s.mu.Unlock()
-			paceDownload(n)
+			paceDownload(n, s.bvid)
 		}
 		if rerr == io.EOF {
 			return nil
@@ -1350,11 +1468,16 @@ func (s *spool) downloadOne(rawURL string) error {
 	}
 }
 
-// paceDownload 全局限速：播放中 384KB/s，空闲 1MB/s。
-func paceDownload(n int) {
+// paceDownload 全局限速：空闲 1MB/s；播放中当前视频 512KB/s，其它视频 64KB/s。
+// 播放时把「别的视频」的预取压到很低，避免 TLS 解密+写盘与单核解码抢 CPU（表现为画面偶发卡顿）。
+func paceDownload(n int, bvid string) {
 	rate := int64(1 << 20)
-	if playbackActive() {
-		rate = PrefetchPlayingRate
+	if active := playbackActiveBvid(); active != "" {
+		if active == bvid {
+			rate = PrefetchPlayingRate
+		} else {
+			rate = 64 << 10
+		}
 	}
 	if rate <= 0 || n <= 0 {
 		return
@@ -1377,6 +1500,16 @@ func playbackActive() bool {
 	mu.Lock()
 	defer mu.Unlock()
 	return sessionOn
+}
+
+// playbackActiveBvid 返回当前播放的 bvid（无播放时为空）。
+func playbackActiveBvid() string {
+	mu.Lock()
+	defer mu.Unlock()
+	if !sessionOn {
+		return ""
+	}
+	return currentBvid
 }
 
 func (s *spool) finish(err error) {
@@ -1468,10 +1601,10 @@ func serveSpool(w http.ResponseWriter, r *http.Request, s *spool) {
 		return
 	}
 	if hasRange {
-		if !s.waitFor(start+1, StreamIdleTimeout) {
+		if !s.waitFor(start+1, SpoolRangeWaitMax) {
 			atomic.AddInt64(&streamStalls, 1)
 			atomic.AddInt64(&cacheFallbacks, 1)
-			log.Printf("[BiliDaemon] spool %s range wait timeout at %d, fallback direct", s.bvid, start)
+			log.Printf("[BiliDaemon] spool %s range wait timeout at %d (2s), fallback direct", s.bvid, start)
 			proxyUpstream(w, r, s.bvid, nil, "video/mp4", StreamIdleTimeout, &streamBytes)
 			return
 		}

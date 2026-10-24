@@ -177,11 +177,19 @@ var script = {
       ],
       // Detail
       detail: null,
+      // History（观看历史，持久化在 daemon 侧）
+      history: [],
+      loadingHistory: false,
+      // 版本号（从 daemon /api/ping 取，显示在「我的」页）
+      appVersion: '',
       // Player
       playSize: { w: 640, h: 360 },
       srcSize: { w: 640, h: 360 },
       cropMode: false,
       vDuration: 0,
+      isPaused: false,
+      curPos: 0,
+      progress: 0,
       rgav: null,
       // Login
       isLoggedIn: false,
@@ -234,6 +242,7 @@ var script = {
           http.request({ url: 'http://127.0.0.1:18080/api/ping', method: 'GET', timeout: 1500 })
             .then((res) => {
               const v = typeof res.body === 'string' ? JSON.parse(res.body || '{}') : res.body;
+              this.appVersion = (v && v.version) || '';
               console.warn('[BiliPen] daemon version:', v && v.version, 'pid:', v && v.pid);
             })
             .catch(() => {});
@@ -269,6 +278,32 @@ var script = {
         this.refreshQr();
       }, 1000);
     },
+    _shExec(cmd) {
+      try {
+        const sh = (nekolib && nekolib.shell) || (nekolib && nekolib.default && nekolib.default.shell);
+        if (sh && sh.exec) { sh.exec(cmd); return true; }
+      } catch (e) {}
+      return false;
+    },
+    _startKeepScreen() {
+      // 设备 input-event-daemon 空闲 30s 降屏 / 60s 息屏 / 600s 关机；
+      // 播放期间没有触摸事件，需定时调 hal-screen keep 续亮（单次约 30s）。
+      this._stopKeepScreen();
+      if (this._shExec('hal-screen keep')) {
+        this._keepScreenTimer = this.$page.setInterval(() => {
+          this._shExec('hal-screen keep');
+        }, 20000);
+        console.warn('[Screen] keep on');
+      }
+    },
+    _stopKeepScreen() {
+      try {
+        if (this._keepScreenTimer) {
+          this.$page.clearInterval(this._keepScreenTimer);
+          this._keepScreenTimer = null;
+        }
+      } catch (e) {}
+    },
     switchTab(tab) {
       if (this.isPlaying) {
         this.stop();
@@ -282,7 +317,51 @@ var script = {
         } else {
           this.fetchUserInfo();
         }
+      } else if (tab === 'history') {
+        this.fetchHistory();
       }
+    },
+    historyTime(ts) {
+      const t = Number(ts) || 0;
+      if (!t) return '';
+      const d = new Date(t * 1000);
+      const p = (n) => (n < 10 ? '0' + n : '' + n);
+      return (d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    },
+    async fetchHistory() {
+      this.loadingHistory = true;
+      try {
+        const res = await http.request({
+          url: 'http://127.0.0.1:18080/api/history',
+          method: 'GET',
+          timeout: 4000
+        });
+        const data = typeof res.body === 'string' ? JSON.parse(res.body || '{}') : res.body;
+        this.history = (data && data.items) ? data.items : [];
+        console.warn('[History] items=' + this.history.length);
+      } catch (e) {
+        this.history = [];
+      }
+      this.loadingHistory = false;
+    },
+    recordHistory(item, position, duration) {
+      try {
+        if (!item || !item.bvid) return;
+        const title = item.title || this.currentTitle || '';
+        const pic = item.pic || item.pic_local || '';
+        const pos = Number(position) || 0;
+        const dur = Number(duration) || 0;
+        const url = 'http://127.0.0.1:18080/api/history/add?bvid=' + encodeURIComponent(item.bvid) +
+          '&title=' + encodeURIComponent(title) + '&pic=' + encodeURIComponent(pic) +
+          '&position=' + pos.toFixed(1) + '&duration=' + dur.toFixed(1);
+        http.request({ url: url, method: 'GET', timeout: 2500 }).catch(() => {});
+      } catch (e) {}
+    },
+    async clearHistory() {
+      try {
+        await http.request({ url: 'http://127.0.0.1:18080/api/history/clear', method: 'GET', timeout: 3000 });
+      } catch (e) {}
+      this.fetchHistory();
     },
     async fetchUserInfo() {
       try {
@@ -417,6 +496,43 @@ var script = {
       const ss = Math.floor(s % 60);
       return m + ':' + (ss < 10 ? '0' + ss : ss);
     },
+    fmtTime(sec) {
+      const s = Math.max(0, Math.floor(Number(sec) || 0));
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const ss = s % 60;
+      const mm = (h > 0 && m < 10) ? ('0' + m) : ('' + m);
+      const sss = ss < 10 ? ('0' + ss) : ('' + ss);
+      return (h > 0 ? (h + ':' + mm) : mm) + ':' + sss;
+    },
+    togglePause() {
+      if (!this.isPlaying || this.isStopping) return;
+      this.isPaused = !this.isPaused;
+      if (this.isPaused) {
+        // 暂停：视频解码线程原地等待 + 音频设备暂停，两边内容时间都不再推进。
+        try { if (this.rgav && typeof this.rgav.pause === 'function') this.rgav.pause(); } catch (e) {}
+        try { if (this.audioPlayer && typeof this.audioPlayer.pause === 'function') this.audioPlayer.pause(); } catch (e) {}
+        try { if (this.vPlayer && typeof this.vPlayer.pause === 'function') this.vPlayer.pause(); } catch (e) {}
+        this.statusText = '已暂停';
+        console.warn('[Player] paused');
+      } else {
+        try { if (this.rgav && typeof this.rgav.unpause === 'function') this.rgav.unpause(); } catch (e) {}
+        try { if (this.audioPlayer && typeof this.audioPlayer.resume === 'function') this.audioPlayer.resume(); } catch (e) {}
+        try { if (this.vPlayer && typeof this.vPlayer.resume === 'function') this.vPlayer.resume(); } catch (e) {}
+        this.statusText = '';
+        console.warn('[Player] resumed');
+      }
+    },
+    _updateProgress() {
+      if (!this.isPlaying || this.audioMode) return;
+      const now = Date.now();
+      if (now - (this._progAt || 0) < 400) return;
+      this._progAt = now;
+      const pos = this._lastPos || 0;
+      const dur = this.vDuration || 0;
+      if (pos > 0 && Math.abs(pos - (this.curPos || 0)) >= 0.2) this.curPos = pos;
+      if (dur > 0) this.progress = Math.min(1, Math.max(0, pos / dur));
+    },
     formatCount(n) {
       const v = Number(n) || 0;
       if (v >= 100000000) return (v / 100000000).toFixed(1) + '亿';
@@ -502,6 +618,13 @@ var script = {
     startVideo() {
       const item = this.detailItem();
       if (!item) return;
+      // 防抖：触摸屏偶尔会把一次点击识别成两次，重复起播会重启解码、拖慢出画。
+      const now = Date.now();
+      if (this._lastVideoStartAt && now - this._lastVideoStartAt < 600) {
+        console.warn('[Rga] startVideo debounce');
+        return;
+      }
+      this._lastVideoStartAt = now;
       const d = this.detailData();
       const dim = (d && d.dimension) || item.dimension || { width: 640, height: 360 };
       if (this.rgav && typeof this.rgav.start === 'function') {
@@ -525,12 +648,15 @@ var script = {
       this.audioMode = false;
       this.currentTitle = item.title || '';
       this.currentBvid = item.bvid;
+      this._playItem = item;
+      this.recordHistory(item);
       this.srcSize = { w: Number(dim.width) || 640, h: Number(dim.height) || 360 };
       this.playSize = dec;
       this.vDuration = 0;
       this.statusText = '准备播放...';
       this.isPlaying = true;
       this.isStopping = false;
+      this._startKeepScreen();
       this._frames = 0;
       this._drawMs = 0;
       this._perfAt = Date.now();
@@ -538,6 +664,21 @@ var script = {
       this._maxGap = 0;
       this._audioRetry = 0;
       this._lastNativeRead = 0;
+      this._syncDone = false;
+      this._lastPos = 0;
+      this._audioPos = 0;
+      this._audioPosAt = 0;
+      this._audioUnit = 0;
+      this._lastAdjustAt = 0;
+      this._resumeAt = 0;
+      this._latePrimeAt = 0;
+      this._latePrimeDone = false;
+      this._primeCheckAt = 0;
+      this.isPaused = false;
+      this.curPos = 0;
+      this.progress = 0;
+      this._progAt = 0;
+      this._driftLogged = false;
       console.warn('[Rga] play ' + item.bvid + ' dec=' + dec.w + 'x' + dec.h);
       // 尽早在起播阶段就释放上一路音频，给 ALSA 更长的回收时间。
       this._stopAudioOnly();
@@ -574,7 +715,9 @@ var script = {
         this.rgav.setBuffer(this.imageData.data.buffer, dec.w, dec.h);
         this.rgav.start('http://127.0.0.1:18080/api/stream?bvid=' + item.bvid);
         console.warn('[Rga] video started');
-        this._startNativeAudio(gen, item);
+        // 关键：等视频首帧解码就绪（primed）后再启动音频。
+        // 部分视频首帧 open+probe 要 1~2s，若音频先起播，视频内容 0 点会被推后 → 音频超前。
+        this._waitPrimedThenAudio(gen, item);
         if (this._vidTimer) this.$page.clearInterval(this._vidTimer);
         this._vidTimer = this.$page.setInterval(() => {
           if (gen !== this.playGen) return;
@@ -590,9 +733,11 @@ var script = {
     _nativeTick(gen, ctx) {
       try {
         const now = Date.now();
-        // 降渲染负载：24fps 上限，同时减少 readFrame 的 921KB 内存拷贝次数。
-        if (now - (this._lastNativeRead || 0) < 41) return;
+        // 渲染上限 30fps（与 B 站 30fps 视频流一致）。低于内容帧率会让视频内容时间持续落后，
+        // 表现为音频越来越超前；native 侧另有「落后 80ms 丢帧追帧」兜底。
+        if (now - (this._lastNativeRead || 0) < 33) return;
         this._lastNativeRead = now;
+        this._infoAt = this._infoAt || 0;
         const t0 = now;
         const got = this.rgav.readFrame();
         if (got) {
@@ -609,24 +754,92 @@ var script = {
             const sec = (now - this._perfAt) / 1000;
             const fps = Math.round(this._frames / sec);
             const avg = this._frames > 0 ? Math.round(this._drawMs / this._frames) : 0;
-            console.warn('[Perf] native draws/s=' + fps + ' avg=' + avg + 'ms maxgap=' + (this._maxGap || 0) + ' out=' + this.playSize.w + 'x' + this.playSize.h);
+            console.warn('[Perf] native draws/s=' + fps + ' avg=' + avg + 'ms maxgap=' + (this._maxGap || 0) + ' pos=' + (this._lastPos || 0).toFixed(1) + ' apos=' + (this._audioPos || 0).toFixed(1) + ' out=' + this.playSize.w + 'x' + this.playSize.h);
             this._frames = 0;
             this._drawMs = 0;
             this._maxGap = 0;
             this._perfAt = now;
           }
         }
-        const info = this.rgav.info();
-        if (info) {
-          if (info.duration > 0 && Math.abs(info.duration - this.vDuration) > 1) this.vDuration = info.duration;
-          if (info.finished) {
-            console.warn('[Rga] finished');
-            this.stop();
+        // 每帧只取 position 数值（不创建 JS 对象）；info() 降到 ~0.8s 一次，
+        // 减少 QuickJS 堆分配与 GC 抖动（这是主线程偶发卡顿的来源之一）。
+        try {
+          const pos = this.rgav.position();
+          if (pos > 0) this._lastPos = pos;
+        } catch (e) {}
+        this._updateProgress();
+        // 视频首帧晚于音频起播（primed 超时兜底路径）：视频内容从 0 开始而音频已经播了一段，
+        // 等视频真正就绪后，按“起播后已过去的时间”额外跳帧追上音频。
+        if (this._latePrimeAt && !this._latePrimeDone && this._syncDone) {
+          if (now - (this._primeCheckAt || 0) > 200) {
+            this._primeCheckAt = now;
+            let primedNow = false;
+            try {
+              const inf = this.rgav.info();
+              primedNow = !!(inf && inf.primed);
+            } catch (e) {}
+            if (primedNow) {
+              this._latePrimeDone = true;
+              const D = (Date.now() - (this._resumeAt || this._latePrimeAt)) / 1000;
+              if (D > 0.2) {
+                try {
+                  this.rgav.adjust(D);
+                  console.warn('[Sync] late-prime adjust D=' + D.toFixed(2));
+                } catch (e) {}
+              }
+            }
+          }
+        }
+        // 动态音画对齐已关闭：onPosition 只有整秒精度（±0.5s 噪声），用它修正会累积误差、越修越偏。
+        // 现在用 onInfo 触发的固定补偿（resume offset），onPosition 仅用于 [Perf] 观测。
+        if (false) {
+          const delta = (this._audioPos || 0) - (this._lastPos || 0);
+          if (Math.abs(delta) > 0.15) {
+            try { this.rgav.adjust(delta); } catch (e) {}
+          }
+        }
+        if (now - (this._infoAt || 0) >= 800) {
+          this._infoAt = now;
+          const info = this.rgav.info();
+          if (info) {
+            if (info.duration > 0 && Math.abs(info.duration - this.vDuration) > 1) this.vDuration = info.duration;
+            if (info.finished) {
+              console.warn('[Rga] finished');
+              this.stop();
+            }
           }
         }
       } catch (e) {
         console.warn('[Rga] tick error: ' + e);
       }
+    },
+    _waitPrimedThenAudio(gen, item) {
+      const startedAt = Date.now();
+      const tryStart = () => {
+        if (gen !== this.playGen || this.isStopping) return;
+        let primed = false;
+        try {
+          const i = this.rgav.info();
+          primed = !!(i && i.primed);
+        } catch (e) {}
+        // 视频首帧就绪后再起音频，让两端内容 0 点尽量对齐；超时 4s 也起音频，避免完全没声音。
+        if (primed || Date.now() - startedAt > 4000) {
+          console.warn('[Sync] video primed=' + primed + ' after ' + (Date.now() - startedAt) + 'ms, start audio');
+          if (!primed) {
+            // 视频首帧比音频晚很多：先起音频，等视频真正就绪后按“已过去的时间”补跳帧（见 _nativeTick）。
+            this._latePrimeAt = Date.now();
+            this._latePrimeDone = false;
+          }
+          this._startNativeAudio(gen, item);
+          if (this._syncTimer) this.$page.clearTimeout(this._syncTimer);
+          this._syncTimer = this.$page.setTimeout(() => {
+            this._syncResume(gen, 'fallback-timeout');
+          }, 3000);
+          return;
+        }
+        this.$page.setTimeout(tryStart, 100);
+      };
+      this.$page.setTimeout(tryStart, 80);
     },
     _startNativeAudio(gen, item) {
       // 先彻底释放上一路音频：softvideo 的 stop 会 closeAudioDevice，需要时间让 ALSA 回收。
@@ -675,12 +888,42 @@ var script = {
               }, 1200);
             }
           });
+          bind('onPosition', (p) => {
+            // vendor 播放器回调音频播放位置：用它做动态音画对齐。
+            let a = Number(p) || 0;
+            const vpos = this._lastPos || 0;
+            if (!this._audioUnit && a > 0) {
+              // 自动识别单位：秒 or 毫秒（取与视频位置更接近的换算）。
+              this._audioUnit = (Math.abs(a - vpos) <= Math.abs(a / 1000 - vpos)) ? 1 : 1000;
+            }
+            if (this._audioUnit === 1000) a = a / 1000;
+            this._audioPos = a;
+            this._audioPosAt = Date.now();
+            // 不再用 onPosition 触发起播：它是整秒精度，用来跳到某秒会造成大幅误差。
+          });
+          bind('onInfo', () => {
+            // 实测音频输出启动比 onInfo 回调更早，视频起播时跳过约 0.45s 内容做补偿。
+            this.$page.setTimeout(() => { this._syncResume(gen, 'audio-info', 0.45); }, 120);
+          });
           ap.start('http://127.0.0.1:18080/api/audio?bvid=' + item.bvid + '&variant=remux');
           console.warn('[Rga] audio started, pause=' + (typeof ap.pause));
         } catch (e) {
           console.warn('[Rga] audio init error: ' + e);
         }
       }, wait);
+    },
+    _syncResume(gen, why, offset) {
+      if (gen !== this.playGen || this._syncDone || this.isStopping) return;
+      this._syncDone = true;
+      try {
+        if (this._syncTimer) { this.$page.clearTimeout(this._syncTimer); this._syncTimer = null; }
+        const off = Number(offset) || 0;
+        this._resumeAt = Date.now();
+        if (this.rgav && typeof this.rgav.resume === 'function') this.rgav.resume(off);
+        console.warn('[Sync] resume video (' + why + ') offset=' + off.toFixed(2));
+      } catch (e) {
+        console.warn('[Sync] resume failed: ' + e);
+      }
     },
     _stopAudioOnly() {
       let stopped = false;
@@ -708,12 +951,20 @@ var script = {
       }
     },
     _stopNative() {
+      this._stopKeepScreen();
       try {
         if (this._vidTimer) {
           this.$page.clearInterval(this._vidTimer);
           this._vidTimer = null;
         }
       } catch (e) {}
+      try {
+        if (this._syncTimer) {
+          this.$page.clearTimeout(this._syncTimer);
+          this._syncTimer = null;
+        }
+      } catch (e) {}
+      this._syncDone = false;
       this._stopAudioOnly();
       try {
         if (this.rgav) this.rgav.stop();
@@ -806,6 +1057,7 @@ var script = {
       this.currentBvid = item.bvid;
       this.vDuration = 0;
       this._playItem = item;
+      this.recordHistory(item);
       this._playOpts = opts;
       this._signalSeen = false;
       this._audioFailed = false;
@@ -827,6 +1079,7 @@ var script = {
 
       this.statusText = '准备播放: ' + (item.title ? item.title.slice(0, 10) : '') + '...';
       this.isPlaying = true;
+      this._startKeepScreen();
       if (prevPlayer) {
         try { prevPlayer.stop(); } catch(e) { console.warn("[SoftVPlayer] prev player stop error:", e); }
       }
@@ -1035,6 +1288,10 @@ var script = {
         }).catch(() => {});
       } catch (e) {}
       this._stopNative();
+      // 更新观看历史：记录本次播放停止时的进度与时长。
+      try {
+        if (this._playItem) this.recordHistory(this._playItem, this._lastPos || this.curPos || 0, this.vDuration || 0);
+      } catch (e) {}
       const gen = this.playGen || 0;
       this.statusText = '正在退出播放...';
       const player = this.vPlayer;
@@ -1070,6 +1327,9 @@ var script = {
         this.imageData = null;
         this._imageSize = '';
         this.isPlaying = false;
+        this.isPaused = false;
+        this.curPos = 0;
+        this.progress = 0;
         this.audioMode = false;
         this.currentTitle = '';
         this.currentBvid = '';
@@ -1316,6 +1576,11 @@ var style_0 = { "_": {
     "fontSize": "11px",
     "marginBottom": "8px"
   },
+  "app-version": {
+    "color": "#666b75",
+    "fontSize": "10px",
+    "marginTop": "6px"
+  },
   "btn-action": {
     "backgroundColor": "#fb7299",
     "borderRadius": "4px",
@@ -1354,6 +1619,47 @@ var style_0 = { "_": {
     "height": "360px",
     "transform": "scale(0.4777)",
     "transformOrigin": "center center"
+  },
+  "player-progress": {
+    "position": "absolute",
+    "left": "10px",
+    "width": "620px",
+    "bottom": "4px",
+    "height": "18px",
+    "flexDirection": "row",
+    "alignItems": "center",
+    "zIndex": 101
+  },
+  "pp-time": {
+    "width": "72px",
+    "color": "#ffffff",
+    "fontSize": "10px"
+  },
+  "pp-bar": {
+    "width": "500px",
+    "height": "6px",
+    "marginLeft": "8px",
+    "backgroundColor": "rgba(255,255,255,0.25)",
+    "borderRadius": "3px"
+  },
+  "pp-fill": {
+    "height": "6px",
+    "backgroundColor": "#fb7299",
+    "borderRadius": "3px"
+  },
+  "pp-btn": {
+    "width": "30px",
+    "height": "16px",
+    "marginLeft": "8px",
+    "backgroundColor": "rgba(255,255,255,0.18)",
+    "borderRadius": "3px",
+    "justifyContent": "center",
+    "alignItems": "center"
+  },
+  "pp-btn-text": {
+    "color": "#ffffff",
+    "fontSize": "10px",
+    "fontWeight": "bold"
   },
   "player-header": {
     "position": "absolute",
@@ -1701,6 +2007,17 @@ var render = function () {
         ]),
         _c('div', {
           staticClass: ["nav-btn"],
+          class: [_vm.currentTab === 'history' ? 'nav-btn-active' : ''],
+          on: { "click": function () { _vm.switchTab('history'); } }
+        }, [
+          _c('text', {
+            staticClass: ["nav-btn-text"],
+            class: [_vm.currentTab === 'history' ? 'nav-btn-text-active' : ''],
+            on: { "click": function () { _vm.switchTab('history'); } }
+          }, [_vm._v("历史")])
+        ]),
+        _c('div', {
+          staticClass: ["nav-btn"],
           class: [_vm.currentTab === 'search' ? 'nav-btn-active' : ''],
           on: { "click": function () { _vm.switchTab('search'); } }
         }, [
@@ -1752,6 +2069,11 @@ var render = function () {
           _c('div', { staticClass: ["btn-search"], on: { "click": _vm.submitSearch } }, [
             _c('text', { staticClass: ["btn-search-text"] }, [_vm._v("搜索")])
           ])
+        ]) : (_vm.currentTab === 'history') ? _c('div', { staticClass: ["banner"] }, [
+          _c('text', { staticClass: ["banner-text"] }, [_vm._v("观看历史 · " + _vm._s(_vm.history.length) + " 条")]),
+          _c('div', { staticClass: ["btn-change"], on: { "click": _vm.clearHistory } }, [
+            _c('text', { staticClass: ["btn-change-text"] }, [_vm._v("清空 🗑")])
+          ])
         ]) : _c('div', { staticClass: ["banner"] }, [
           _c('text', { staticClass: ["banner-text"] }, [_vm._v("哔哩哔哩账号中心")])
         ]),
@@ -1779,6 +2101,34 @@ var render = function () {
             ])
           ]);
         })) : _vm._e(),
+
+        // Tab: History（观看历史）
+        (_vm.currentTab === 'history') ? (_vm.history.length > 0 ? _c('scroller', {
+          staticClass: ["card-scroller"],
+          style: { "height": "146px" },
+          attrs: { "scrollDirection": "horizontal" }
+        }, _vm._l(_vm.history, function (item, index) {
+          return _c('div', {
+            key: item.bvid,
+            staticClass: ["video-card"],
+            style: { "height": "138px" },
+            on: { "click": function ($event) { _vm.openDetail({ bvid: item.bvid, title: item.title, pic: item.pic }); } }
+          }, [
+            _c('image', {
+              staticClass: ["card-thumb"],
+              attrs: { "src": _vm.thumbUrl(item.pic) }
+            }),
+            _c('div', { staticClass: ["card-info"] }, [
+              _c('text', { staticClass: ["video-card-title"] }, [_vm._v(_vm._s(item.title) || item.bvid)]),
+              _c('div', { staticClass: ["video-card-footer"] }, [
+                _c('text', { staticClass: ["video-card-owner"] }, [_vm._v(_vm.historyTime(item.updated))]),
+                _c('text', { staticClass: ["video-card-action"] }, [_vm._v(item.duration > 0 ? ('看至 ' + Math.round((item.position / (item.duration || 1)) * 100) + '%') : '详情')])
+              ])
+            ])
+          ]);
+        })) : _c('div', { staticClass: ["banner"] }, [
+          _c('text', { staticClass: ["banner-text"] }, [_vm._v("暂无观看历史，播放过的视频会出现在这里")])
+        ])) : _vm._e(),
 
         // Tab 2: Search
         (_vm.currentTab === 'search') ? _c('scroller', {
@@ -1842,7 +2192,8 @@ var render = function () {
                 _c('text', { staticClass: ["btn-action-text"] }, [_vm._v("退出登录")])
               ])
             ])
-          ])
+          ]),
+          _c('text', { staticClass: ["app-version"] }, [_vm._v("BiliPen v" + (_vm.appVersion || '-'))])
         ]) : _vm._e()
       ])
     ]),
@@ -1888,7 +2239,7 @@ var render = function () {
 
     // Fullscreen Player Overlay (active when isPlaying is true)
     (_vm.isPlaying) ? _c('div', { staticClass: ["player-panel"] }, [
-      _c('div', { staticClass: ["player-canvas-box"] }, [
+      _c('div', { staticClass: ["player-canvas-box"], on: { "click": _vm.togglePause } }, [
         _c('canvas', {
           ref: "aCanvas",
           attrs: { "id": "aCanvas", "canvas-id": "aCanvas", "width": "160", "height": "90" },
@@ -1917,6 +2268,15 @@ var render = function () {
           }
         })
       ]),
+      (!_vm.audioMode) ? _c('div', { staticClass: ["player-progress"] }, [
+        _c('text', { staticClass: ["pp-time"] }, [_vm._v(_vm.fmtTime(_vm.curPos) + ' / ' + _vm.fmtTime(_vm.vDuration))]),
+        _c('div', { staticClass: ["pp-bar"] }, [
+          _c('div', { staticClass: ["pp-fill"], style: { width: Math.round((_vm.progress || 0) * 100) + '%' } })
+        ]),
+        _c('div', { staticClass: ["pp-btn"], on: { "click": _vm.togglePause } }, [
+          _c('text', { staticClass: ["pp-btn-text"] }, [_vm._v(_vm.isPaused ? "▶" : "❚❚")])
+        ])
+      ]) : _vm._e(),
       (_vm.audioMode) ? _c('div', { staticClass: ["audio-ui"] }, [
         _c('image', { staticClass: ["audio-cover"], attrs: { "src": _vm.detailSrc() } }),
         _c('div', { staticClass: ["audio-info"] }, [
@@ -2001,7 +2361,7 @@ App$1.meta = {
   }
 };
 App$1.meta.name = '笔上哔哩';
-App$1.meta.version = '2.2.1';
+App$1.meta.version = '2.3.1';
 App$1.meta.isSingleJsBundle = false;
 $falcon.__AppClazz = App$1;
 $falcon.__loadModuleDefault = async function (fileName) {
@@ -2027,7 +2387,7 @@ with open(os.path.join(PKG_DIR, "app.js"), "w", encoding="utf-8") as f:
 # 4. Manifest template
 manifest = {
     "appName": "笔上哔哩",
-    "version": "2.2.1",
+    "version": "2.3.1",
     "appid": "9002000869905604",
     "icon": "app_icon.png",
     "quickjs": {
