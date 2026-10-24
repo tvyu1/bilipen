@@ -1,0 +1,5 @@
+*.so binary
+*.amr binary
+*.png binary
+*.bin binary
+*.jpg binary
