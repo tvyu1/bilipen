@@ -202,6 +202,9 @@ var script = {
   },
   mounted() {
     globalThis.__biliVm = this;
+    this._logImeSupport();
+    this._initImeApi();
+    this._bindTextEditFinished();
     this.bootstrapDaemon();
     this.testSoftVideo();
     this.syncDaemonState();
@@ -218,6 +221,8 @@ var script = {
   onUnload() {
     console.warn('[Lifecycle] vm onUnload, stop playback');
     try { this.stop(); } catch (e) {}
+    try { this._cancelTextEdit(); } catch (e) {}
+    try { this._unbindTextEditFinished(); } catch (e) {}
   },
   methods: {
     async loadNativeVideo() {
@@ -445,9 +450,176 @@ var script = {
       else if (e && e.value !== undefined) v = e.value;
       this.searchInput = String(v === undefined || v === null ? '' : v);
     },
+    _falconObj() {
+      try { if (typeof $falcon !== 'undefined' && $falcon) return $falcon; } catch (e) {}
+      try { if (globalThis && globalThis.$falcon) return globalThis.$falcon; } catch (e) {}
+      return null;
+    },
+    _initImeApi() {
+      // 原生输入法 API 由 /etc/miniapp/jsapis/libjsapi_export_core.so 提供：
+      // import('global').default.Global 是构造函数，实例上才有
+      // startTextEdit / closeTextEdit / textEditFinished 等（$falcon.startTextEdit 在本机不存在）。
+      const self = this;
+      try {
+        import('global').then(function (m) {
+          const mod = (m && m.default) ? m.default : m;
+          const Ctor = (mod && mod.Global) ? mod.Global : null;
+          if (typeof Ctor !== 'function') {
+            console.warn('[IME] Global constructor not found');
+            return;
+          }
+          const inst = new Ctor();
+          self._imeApi = inst;
+          const sig = inst.textEditFinished;
+          console.warn('[IME] instance ready start=' + (typeof inst.startTextEdit) +
+            ' close=' + (typeof inst.closeTextEdit) + ' sig=' + (typeof sig) +
+            ' sigOn=' + !!(sig && typeof sig.on === 'function'));
+          self._bindTextEditFinished();
+        }).catch(function (e) {
+          console.warn('[IME] import global failed: ' + e);
+        });
+      } catch (e) {
+        console.warn('[IME] import global throw: ' + e);
+      }
+    },
+    _imeObj() {
+      if (this._imeApi) return this._imeApi;
+      const f = this._falconObj();
+      if (f && typeof f.startTextEdit === 'function') return f;
+      return null;
+    },
+    _logImeSupport() {
+      const f = this._falconObj();
+      console.warn('[IME] falcon=' + !!f + ' falcon.startTextEdit=' + (f && typeof f.startTextEdit));
+      return false;
+    },
+    _bindTextEditFinished() {
+      if (this._imeBound) return;
+      const f = this._imeObj();
+      if (!f) return;
+      const self = this;
+      // 必须完整转发所有参数：该信号实际回调为 (taskUuid, resultJson)，
+      // 若包装函数只声明一个参数，第二个参数（结果 JSON）会被丢掉。
+      const cb = function () { self._onTextEditFinished.apply(self, arguments); };
+      try {
+        if (f.textEditFinished && typeof f.textEditFinished.on === 'function') {
+          f.textEditFinished.on(cb);
+          this._imeCb = cb;
+          this._imeBound = 'signal';
+          console.warn('[IME] textEditFinished bound (signal)');
+          return;
+        }
+        if (typeof f.on === 'function') {
+          f.on('textEditFinished', cb);
+          this._imeCb = cb;
+          this._imeBound = 'event';
+          console.warn('[IME] textEditFinished bound (event)');
+        }
+      } catch (e) {
+        console.warn('[IME] bind error: ' + e);
+      }
+    },
+    _unbindTextEditFinished() {
+      const f = this._imeObj();
+      try {
+        if (this._imeCb && f && this._imeBound === 'signal' && f.textEditFinished && typeof f.textEditFinished.off === 'function') {
+          f.textEditFinished.off(this._imeCb);
+        } else if (this._imeCb && f && this._imeBound === 'event' && typeof f.off === 'function') {
+          f.off('textEditFinished', this._imeCb);
+        }
+      } catch (e) {}
+      this._imeCb = null;
+      this._imeBound = false;
+    },
+    _onTextEditFinished() {
+      // 实测该信号回调的第一个参数是 taskUuid，真正的结果 JSON 在后续参数中，
+      // 因此遍历所有参数、对字符串逐个尝试 JSON.parse，找到含 editConfirmed/text 的对象。
+      const n = arguments.length;
+      const raw = [];
+      for (let i = 0; i < n; i++) {
+        try {
+          let v = arguments[i];
+          if (v && typeof v === 'object') {
+            try { v = JSON.stringify(v); } catch (e) { v = '[object]'; }
+          }
+          raw.push(String(v));
+        } catch (e) { raw.push('?'); }
+      }
+      console.warn('[IME] raw args n=' + n + ' [' + raw.join(' || ').slice(0, 600) + ']');
+
+      let result = null;
+      for (let i = 0; i < n; i++) {
+        let cand = arguments[i];
+        if (cand && typeof cand === 'object') {
+          if (cand.text !== undefined || cand.editConfirmed !== undefined) { result = cand; break; }
+          continue;
+        }
+        if (typeof cand !== 'string' || cand.length === 0) continue;
+        try {
+          const obj = JSON.parse(cand);
+          if (obj && typeof obj === 'object' && (obj.text !== undefined || obj.editConfirmed !== undefined)) {
+            result = obj;
+            break;
+          }
+        } catch (e) {}
+        // 兼容被二次编码的 JSON 字符串
+        const idx = cand.indexOf('{');
+        if (idx > 0) {
+          try {
+            const obj2 = JSON.parse(cand.slice(idx));
+            if (obj2 && typeof obj2 === 'object' && (obj2.text !== undefined || obj2.editConfirmed !== undefined)) {
+              result = obj2;
+              break;
+            }
+          } catch (e) {}
+        }
+      }
+
+      this._textEditUuid = null;
+      if (!result) {
+        console.warn('[IME] finished but result not parsed');
+        return;
+      }
+      console.warn('[IME] finished confirmed=' + result.editConfirmed + ' text=' + result.text);
+      if (result.text !== undefined && result.text !== null) this.searchInput = String(result.text);
+      if (result.editConfirmed !== false && (this.searchInput || '').trim()) {
+        this.doSearch(this.searchInput.trim());
+      }
+    },
+    _cancelTextEdit() {
+      const f = this._imeObj();
+      try {
+        if (this._textEditUuid && f && typeof f.closeTextEdit === 'function') f.closeTextEdit(this._textEditUuid);
+      } catch (e) {}
+      this._textEditUuid = null;
+    },
     openKeyboard() {
+      // 调起宿主原生输入法：API 由 jsapi_export_core 的 "global" 模块提供（$falcon.startTextEdit 在本机不存在）。
+      try {
+        const f = this._imeObj();
+        if (f && typeof f.startTextEdit === 'function') {
+          this._bindTextEditFinished();
+          const cfg = {
+            inputType: 'text',
+            enterButtonText: '搜索',
+            confirmButtonDisabledOnTextEmpty: true,
+            multiLinesEditVisible: false,
+            capsLockSwitchOn: false,
+            showCursor: true
+          };
+          const uuid = f.startTextEdit(JSON.stringify(cfg));
+          console.warn('[IME] startTextEdit uuid=' + uuid);
+          if (uuid) {
+            this._textEditUuid = uuid;
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn('[IME] startTextEdit error: ' + e);
+      }
+      // 回退：自绘键盘（原生输入法不可用时）
       this.kbVisible = true;
-      console.warn('[Kb] open');
+      console.warn('[Kb] open (fallback)');
     },
     closeKeyboard() {
       this.kbVisible = false;
@@ -484,6 +656,12 @@ var script = {
       const kw = (this.searchInput || '').trim();
       if (!kw || this.loadingSearch) return;
       this.doSearch(kw);
+    },
+    clearSearchInput() {
+      this.searchInput = '';
+      this.searchResults = [];
+      this.statusText = '';
+      console.warn('[Search] input cleared');
     },
     showToast(msg) {
       this.toast = msg;
@@ -1791,6 +1969,20 @@ var style_0 = { "_": {
     "fontSize": "9px",
     "marginRight": "8px"
   },
+  "btn-clear": {
+    "width": "20px",
+    "height": "20px",
+    "borderRadius": "10px",
+    "marginRight": "8px",
+    "backgroundColor": "#3a3f49",
+    "justifyContent": "center",
+    "alignItems": "center"
+  },
+  "btn-clear-text": {
+    "color": "#c7ccd4",
+    "fontSize": "11px",
+    "fontWeight": "bold"
+  },
   "btn-search": {
     "backgroundColor": "#00aeec",
     "borderRadius": "3px",
@@ -2064,6 +2256,9 @@ var render = function () {
               staticClass: ["search-input-text"],
               class: [_vm.searchInput ? '' : 'search-input-placeholder']
             }, [_vm._v(_vm.searchInput || '点此输入关键词')])
+          ]),
+          _c('div', { staticClass: ["btn-clear"], on: { "click": _vm.clearSearchInput } }, [
+            _c('text', { staticClass: ["btn-clear-text"] }, [_vm._v("✕")])
           ]),
           _c('text', { staticClass: ["search-count"] }, [_vm._v(_vm._s(_vm.searchResults.length) + " 条")]),
           _c('div', { staticClass: ["btn-search"], on: { "click": _vm.submitSearch } }, [
@@ -2361,7 +2556,7 @@ App$1.meta = {
   }
 };
 App$1.meta.name = '笔上哔哩';
-App$1.meta.version = '2.3.1';
+App$1.meta.version = '2.4.0';
 App$1.meta.isSingleJsBundle = false;
 $falcon.__AppClazz = App$1;
 $falcon.__loadModuleDefault = async function (fileName) {
@@ -2387,7 +2582,7 @@ with open(os.path.join(PKG_DIR, "app.js"), "w", encoding="utf-8") as f:
 # 4. Manifest template
 manifest = {
     "appName": "笔上哔哩",
-    "version": "2.3.1",
+    "version": "2.4.0",
     "appid": "9002000869905604",
     "icon": "app_icon.png",
     "quickjs": {

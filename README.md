@@ -2,11 +2,12 @@
 
 网易有道词典笔 A7（型号 `Y09`）上的哔哩哔哩轻应用：Falcon 运行时（Vue2 + QuickJS）前端 + Go 守护进程 + 自研 native 视频解码模块。
 
-**当前版本：v2.3.1** · 版本说明见 [CHANGELOG.md](CHANGELOG.md)
+**当前版本：v2.4.0** · 版本说明见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 功能现状
 
 - **推荐流**：可用
+- **搜索**：可用（点击输入框调起**系统原生输入法**，确认后自动搜索；输入框右侧「✕」清空）
 - **观看历史**：可用（自动记录，含封面/标题/观看时间/进度百分比，支持清空）
 - **扫码登录**：可用（手机 B 站 App 扫码），「我的」页显示当前版本号
 - **视频详情页**：可用（封面/标题/UP/时长/播放量 + 看视频/听视频/下载）
@@ -14,27 +15,25 @@
 - **听视频**：可用，DASH 最高音质音轨，由 daemon 调用设备 ffmpeg 重封装后播放
 - **音画同步**：起播按音频首帧回调对齐 + 固定补偿，视频首帧晚到会自动追帧；真机主观同步
 - **稳定性**：连续起播/退出/切换不再触发系统级崩溃（v2.2.1 修复堆踩踏；后续修掉 spool 阻塞黑屏、视频首帧竞态黑屏等）
-- **搜索**：**暂不可用** —— 该机型 miniapp 原生软键盘不弹出，自绘屏幕键盘方案也未生效，无法输入关键词
 - **下载**：占位按钮，未实现
 
 ## TODO / 路线图
 
 按优先级从高到低：
 
-- [ ] **修复输入法**：解决 miniapp 软键盘无法弹出（含自绘键盘方案）的问题，恢复搜索输入能力
 - [ ] **补全下载功能**：实现真实下载（保存到设备本地，支持离线播放）
 - [ ] **添加本地视频播放**：支持播放设备本地的视频文件
 - [ ] _（低优先级）_ 音频停止后约 1 秒尾音（厂商 `YAudioModule` 的 ALSA 缓冲残留）
 - [ ] _（低优先级）_ 音频偶发爆音 / 失真
 
-> 已完成：观看历史、播放进度条、暂停/播放、音画同步、播放中保持亮屏、画面偏蓝修复。
+> 已完成：观看历史、播放进度条、暂停/播放、音画同步、播放中保持亮屏、画面偏蓝修复、**原生输入法搜索**（v2.4.0）。
 
 ## 项目结构
 
 | 路径 | 说明 |
 |---|---|
 | `README.md` | 本说明（功能、结构、安装、使用、构建、限制、TODO） |
-| `CHANGELOG.md` | 版本说明（当前仅保留最新版本 v2.3.1） |
+| `CHANGELOG.md` | 版本说明（当前仅保留最新版本 v2.4.0） |
 | `build_bili.py` | 打包脚本：编译 Go daemon → 复制 `libs/arm/*.so` → 生成 `bili_pkg/app.js` → 重算 manifest 证书 → 输出 `.amr` |
 | `bili_src/main.go` | Go 守护进程（`bili-daemon`）：B 站接口、搜索/推荐/详情、扫码登录、观看历史、音频 remux、预取缓存、流代理；仅监听 `127.0.0.1:18080` |
 | `bili_src/go.mod`、`go.sum` | Go 模块依赖（仅 `skip2/go-qrcode`） |
@@ -63,6 +62,7 @@ adb shell "miniapp_cli start 9002000869905604"
 ## 使用
 
 - 左侧导航切换「推荐 / 历史 / 搜索 / 登录(我的)」
+- **搜索**：点输入框调起系统原生输入法，输入后点「搜索」确认会自动查询；输入框右侧「✕」清空输入与结果
 - 点任意视频卡片进入详情页，再选「▶ 看视频」「🎧 听视频」「⬇ 下载」
 - 播放时：底部进度条显示「当前时间 / 总时长」；**单击画面**或点右下按钮暂停/继续
 - 播放层右上角可在「适应 / 铺满」间切换显示方式，「✕ 退出播放」返回
@@ -125,9 +125,25 @@ $TC/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc -shared -fPIC -O2 \
 - JS 接口：`setBuffer(arrayBuffer,w,h)`、`start(url)`、`readFrame()`、`stop()`、`pause()`、`unpause()`、`resume(offsetSec)`、`adjust(deltaSec)`、`info()`、`error()`、`duration()`、`position()`
 - 前端每 16ms 轮询 `readFrame()`，渲染上限 30fps；模块不可用时自动回退到 softvideo 视频链路
 
+### 原生输入法（搜索输入）
+
+该机型的文本输入 API **不在 `$falcon` 上**（`$falcon.startTextEdit` 为 `undefined`），而是由设备自带的 `/etc/miniapp/jsapis/libjsapi_export_core.so` 通过 JS 模块 `global` 暴露：
+
+```js
+const mod = (await import('global')).default;   // { Global: <构造函数> }
+const G = new mod.Global();                     // 实例上才有输入法 API
+const taskUuid = G.startTextEdit(JSON.stringify({ inputType: 'text', enterButtonText: '搜索' }));
+G.textEditFinished.on((taskUuid, resultJson) => {
+  const r = JSON.parse(resultJson);             // { text, cursorIndex, editConfirmed }
+  if (r.editConfirmed) { /* 用 r.text 搜索 */ }
+});
+G.closeTextEdit(taskUuid);                      // 主动取消时调用
+```
+
+注意：`textEditFinished` 回调是 **两个参数** `(taskUuid, resultJson)`，包装函数必须完整转发参数，否则结果 JSON 会被丢掉（这是 2.3.x 搜索一直拿不到文本的原因）。实现见 `build_bili.py` 中的 `_initImeApi / _bindTextEditFinished / _onTextEditFinished`。
+
 ## 已知限制
 
-- **搜索键盘不可用**：原生软键盘不弹出，自绘键盘也未能生效，搜索页目前无法输入关键词（中文/英文都不行），见 TODO
 - 「下载」为占位按钮，未实现真实下载，见 TODO
 - 音频：停止后约 1 秒尾音（厂商 `YAudioModule` 的 ALSA 缓冲残留）、偶发爆音/失真（优先级低，见 TODO）
 - native 模块的 YUV→RGBA 用 ffmpeg `sws_scale`，尚未接入 RGA（RGA 需要 dma-buf/连续物理内存）

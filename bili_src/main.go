@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version     = "2.3.1"
+	Version     = "2.4.0"
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
 	UserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
