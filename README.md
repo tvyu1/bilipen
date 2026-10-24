@@ -113,7 +113,6 @@ $TC/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc -shared -fPIC -O2 \
 - 「下载」为占位按钮，未实现真实下载
 - native 模块的 YUV→RGBA 用 ffmpeg `sws_scale`，尚未接入 RGA（RGA 需要 dma-buf/连续物理内存）
 - 本地 `18080` 仅监听 `127.0.0.1`，未做鉴权
-- 设备 UI 偶发触摸无响应/画面冻结（系统层问题，与本应用无关）
 
 ## 免责声明
 
