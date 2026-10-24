@@ -1,0 +1,29 @@
+# ---- 构建产物（可重新生成）----
+9002000869905604.amr
+bili_pkg/app.js
+bili_pkg/manifest.json
+bili_pkg/libs/
+bili_src/bili-daemon
+
+# ---- 大体积二进制 / 本地工具链（见 native/README.md 自行准备）----
+arm-rockchip830-linux-uclibcgnueabihf.tar.gz
+libfalcon.so
+libquickjs.so
+official_index.js.bin
+scratch/libav_arm/
+scratch/*.so
+scratch/*.bin
+scratch/*.png
+scratch/*.gif
+scratch/*.mp4
+scratch/shmdump
+scratch/app_check.mjs
+
+# ---- 杂项 ----
+*.log
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+
+bili_pkg/app_icon.png

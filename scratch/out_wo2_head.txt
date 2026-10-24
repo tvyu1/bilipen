@@ -1,0 +1,60 @@
+0x07ee50: push      {r4, r5, r6, r7, r8, sb, sl, fp, lr} 
+0x07ee54: sub       sp, sp, #0x8c                        
+0x07ee58: ldr       r8, [pc, #0x3a4]                     ; lit@0x7f204 = 0x50bd0 (330704)
+0x07ee5c: mov       r7, r2                               
+0x07ee60: ldr       ip, [sp, #0xb4]                      
+0x07ee64: mov       r6, r3                               
+0x07ee68: ldr       r2, [pc, #0x398]                     ; lit@0x7f208 = 0x50bf0 (330736)
+0x07ee6c: add       r4, sp, #0x30                        
+0x07ee70: str       ip, [sp, #4]                         
+0x07ee74: mov       sb, r0                               
+0x07ee78: ldr       ip, [sp, #0xb8]                      
+0x07ee7c: mov       r0, r4                               
+0x07ee80: add       r2, pc, r2                           
+0x07ee84: ldr       r3, [pc, #0x380]                     ; lit@0x7f20c = 0x560 (1376)
+0x07ee88: ldr       r5, [sp, #0xb0]                      
+0x07ee8c: str       ip, [sp, #8]                         
+0x07ee90: str       r1, [sp]                             
+0x07ee94: mov       r1, #0                               
+0x07ee98: ldr       r3, [r2, r3]                         
+0x07ee9c: mov       r2, #0x54                            
+0x07eea0: add       r8, pc, r8                           
+0x07eea4: ldr       r3, [r3]                             
+0x07eea8: str       r3, [sp, #0x84]                      
+0x07eeac: mov       r3, #0                               
+0x07eeb0: bl        #0x9430                              <memset>
+0x07eeb4: ldr       r3, [pc, #0x354]                     ; lit@0x7f210 = 0x550 (1360)
+0x07eeb8: and       r2, r5, #1                           
+0x07eebc: strb      r2, [sp, #0x49]                      
+0x07eec0: cmp       r2, #0                               
+0x07eec4: ubfx      r2, r5, #1, #1                       
+0x07eec8: mov       r0, r4                               
+0x07eecc: strb      r2, [sp, #0x48]                      
+0x07eed0: movne     r2, #0xd1                            
+0x07eed4: str       sb, [sp, #0x2c]                      
+0x07eed8: moveq     r2, #1                               
+0x07eedc: str       r2, [sp, #0x4c]                      
+0x07eee0: ubfx      r2, r5, #2, #1                       
+0x07eee4: ubfx      r5, r5, #3, #1                       
+0x07eee8: strb      r2, [sp, #0x4a]                      
+0x07eeec: strb      r5, [sp, #0x4b]                      
+0x07eef0: ldr       r5, [r8, r3]                         
+0x07eef4: ldr       r1, [sb, #0x10]                      
+0x07eef8: mov       r2, r5                               
+0x07eefc: bl        #0x8fb0                              <dbuf_init2>
+0x07ef00: vmov.i32  q8, #0                               
+0x07ef04: add       r1, sp, #0x70                        
+0x07ef08: mov       r2, r7                               
+0x07ef0c: mov       r3, r6                               
+0x07ef10: add       r0, sp, #0x2c                        
+0x07ef14: vst1.8    {d16, d17}, [r1]                     
+0x07ef18: vstr      d16, [sp, #0x7c]                     
+0x07ef1c: bl        #0x7d8d4                             func_0x7d8d4
+0x07ef20: cmp       r0, #0                               
+0x07ef24: beq       #0x7efb8                             
+0x07ef28: ldr       r1, [sp, #0x70]                      
+0x07ef2c: mov       r0, sb                               
+0x07ef30: bl        #0x9064                              <js_free>
+0x07ef34: ldr       r1, [sp, #0x7c]                      
+0x07ef38: mov       r0, sb                               
+0x07ef3c: bl        #0x9064                              <js_free>
