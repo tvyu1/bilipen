@@ -28,7 +28,7 @@ import (
 )
 
 const (
-	Version     = "2.2.0"
+	Version     = "2.2.1"
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
 	UserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -129,6 +129,11 @@ var (
 
 	// 同时最多 2 路预取，限制 TLS 解密与写盘并发。
 	spoolSem = make(chan struct{}, 2)
+
+	// 活跃媒体流：/api/stop 时统一取消，让播放器的解码线程尽快退出（否则 stop 会等网络读超时，声音拖尾）。
+	streamMu     sync.Mutex
+	streams      = map[int]context.CancelFunc{}
+	streamNextID int
 
 	// 验收用计数器（/api/metrics）
 	streamBytes    int64
@@ -1596,6 +1601,8 @@ func proxyUpstream(w http.ResponseWriter, r *http.Request, bvid string, candidat
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	sid := registerStream(cancel)
+	defer unregisterStream(sid)
 
 	var resp *http.Response
 	var lastErr error
@@ -1766,6 +1773,8 @@ func handleAudioRemux(w http.ResponseWriter, r *http.Request, bvid string, au au
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	sid := registerStream(cancel)
+	defer unregisterStream(sid)
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostdin",
@@ -1988,9 +1997,39 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	currentMode = ""
 	mu.Unlock()
 
+	// 注意：这里不再强制取消媒体流。厂商 softvideo 播放器在流被服务端提前断开时
+	// 停止过程会触发其内部状态机异常（真机表现为连续操作后崩溃），稳定性优先。
 	log.Printf("[BiliDaemon] playback session stop")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "stopped"})
+}
+
+func registerStream(cancel context.CancelFunc) int {
+	streamMu.Lock()
+	streamNextID++
+	id := streamNextID
+	streams[id] = cancel
+	streamMu.Unlock()
+	return id
+}
+
+func unregisterStream(id int) {
+	streamMu.Lock()
+	delete(streams, id)
+	streamMu.Unlock()
+}
+
+func cancelAllStreams() {
+	streamMu.Lock()
+	n := len(streams)
+	for id, c := range streams {
+		c()
+		delete(streams, id)
+	}
+	streamMu.Unlock()
+	if n > 0 {
+		log.Printf("[BiliDaemon] cancelled %d active streams", n)
+	}
 }
 
 func initHardwareAudio() {

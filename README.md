@@ -2,30 +2,43 @@
 
 网易有道词典笔 A7（型号 `Y09`）上的哔哩哔哩轻应用：Falcon 运行时（Vue2 + QuickJS）前端 + Go 守护进程 + 自研 native 视频解码模块。
 
-**当前版本：v2.2.0** · 版本说明见 [CHANGELOG.md](CHANGELOG.md)
+**当前版本：v2.2.1** · 版本说明见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 功能现状
 
 - **推荐流**：可用
 - **扫码登录**：可用（手机 B 站 App 扫码）
 - **视频详情页**：可用（封面/标题/UP/时长/播放量 + 看视频/听视频/下载）
-- **看视频**：可用，自研 native 模块（FFmpeg 4.4.1 软解 + `sws_scale`），真机约 **30fps**
+- **看视频**：可用，自研 native 模块（FFmpeg 4.4.1 软解 + `sws_scale`），渲染上限 24fps，真机播放稳定
 - **听视频**：可用，DASH 最高音质音轨，由 daemon 调用设备 ffmpeg 重封装后播放
+- **稳定性**：连续「起播 → 退出应用 → 换下一个」不再触发系统级崩溃（v2.2.1 修复堆踩踏问题）
 - **搜索**：**暂不可用** —— 该机型 miniapp 原生软键盘不弹出，自绘屏幕键盘方案也未生效，无法输入关键词
 - **下载**：占位按钮，未实现
+
+## TODO / 路线图
+
+按优先级从高到低：
+
+- [ ] **修复输入法**：解决 miniapp 软键盘无法弹出（含自绘键盘方案）的问题，恢复搜索输入能力
+- [ ] **增加历史记录**：记录最近观看/播放进度，支持从历史继续播放
+- [ ] **补全下载功能**：实现真实下载（保存到设备本地，支持离线播放）
+- [ ] **添加本地视频播放**：支持播放设备本地的视频文件
+- [ ] _（低优先级）_ 音频停止后约 1 秒尾音
+- [ ] _（低优先级）_ 音频偶发爆音 / 失真
+- [ ] _（低优先级）_ 音画同步优化
 
 ## 项目结构
 
 | 路径 | 说明 |
 |---|---|
-| `README.md` | 本说明（功能、结构、安装、使用、构建、限制） |
-| `CHANGELOG.md` | 版本说明（当前仅保留最新版本 v2.2.0） |
+| `README.md` | 本说明（功能、结构、安装、使用、构建、限制、TODO） |
+| `CHANGELOG.md` | 版本说明（当前仅保留最新版本 v2.2.1） |
 | `build_bili.py` | 打包脚本：编译 Go daemon → 复制 `libs/arm/*.so` → 生成 `bili_pkg/app.js` → 重算 manifest 证书 → 输出 `.amr` |
 | `bili_src/main.go` | Go 守护进程（`bili-daemon`）：B 站接口、搜索/推荐/详情、扫码登录、音频 remux、预取缓存、流代理；仅监听 `127.0.0.1:18080` |
 | `bili_src/go.mod`、`go.sum` | Go 模块依赖（仅 `skip2/go-qrcode`） |
 | `native/rgavideo.c` | native 视频解码模块源码：FFmpeg 软解 + `sws_scale` 转 RGBA + 双缓冲 + PTS 节奏，注册为 QuickJS 模块 `rgavideo` |
 | `libjsapi_rgavideo.so` | 预编译 native 模块（ARMv7 / uClibc，13.8KB），随仓库提供，普通构建无需工具链 |
-| `libjsapi_softvideo.so` | 设备自带软解/音频 JSAPI（听视频、看视频音频轨、回退链路使用） |
+| `libjsapi_softvideo.so` | 设备自带软解/音频 JSAPI（听视频、看视频音频轨使用） |
 | `libjsapi_nekolib.so` | 设备自带 shell/文件等 JSAPI（拉起 daemon、日志等使用） |
 | `app_icon.png` | 应用图标 |
 | `.gitignore`、`.gitattributes` | 构建产物与二进制的 git 配置 |
@@ -42,7 +55,7 @@ adb shell "miniapp_cli install /userdisk/9002000869905604.amr"
 adb shell "miniapp_cli start 9002000869905604"
 ```
 
-也可从 [Releases](https://github.com/3804313647/bilipen/releases) 下载最新 AMR。
+也可从 [Releases](https://github.com/tvyu1/bilipen/releases) 下载最新 AMR。
 
 ## 使用
 
@@ -105,12 +118,13 @@ $TC/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc -shared -fPIC -O2 \
 
 - 导出 `custom_init_jsapis`；通过运行时的 `registerCModuleLoader("rgavideo", loader)` 注册 QuickJS 模块
 - JS 接口：`setBuffer(arrayBuffer,w,h)`、`start(url)`、`readFrame()`、`stop()`、`info()`、`error()`、`duration()`、`position()`
-- 前端每 16ms 轮询一次，取到帧才 `putImageData`；模块不可用时自动回退到 softvideo 视频链路
+- 前端每 16ms 轮询一次 `readFrame()`，渲染上限 24fps 以控制单核负载；模块不可用时自动回退到 softvideo 视频链路
 
 ## 已知限制
 
-- **搜索键盘不可用**：原生软键盘不弹出，自绘键盘也未能生效，搜索页目前无法输入关键词（中文/英文都不行）
-- 「下载」为占位按钮，未实现真实下载
+- **搜索键盘不可用**：原生软键盘不弹出，自绘键盘也未能生效，搜索页目前无法输入关键词（中文/英文都不行），见 TODO
+- 「下载」为占位按钮，未实现真实下载，见 TODO
+- 音频：停止后约 1 秒尾音、偶发爆音/失真、音画同步一般（优先级低，见 TODO）
 - native 模块的 YUV→RGBA 用 ffmpeg `sws_scale`，尚未接入 RGA（RGA 需要 dma-buf/连续物理内存）
 - 本地 `18080` 仅监听 `127.0.0.1`，未做鉴权
 

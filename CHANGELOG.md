@@ -1,28 +1,30 @@
 # CHANGELOG
 
-## v2.2.0（2026-10-24）
+## v2.2.1（2026-10-24）
 
-> 主题：自研 native 视频解码模块，看视频 10–12fps → **~30fps**。
-
-### 新增
-
-- **`libjsapi_rgavideo.so`**（13,820 字节）：用 Rockchip `arm-rockchip830-linux-uclibcgnueabihf-gcc 8.3.0` 交叉编译，链接设备自带 FFmpeg 4.4.1（libavformat/libavcodec/libswscale/libavutil）。实现 FFmpeg 软件解码 + `sws_scale` YUV420→RGBA + 双缓冲 + PTS 节奏与丢帧；通过 `registerCModuleLoader("rgavideo", …)` 注册 QuickJS 模块，JS 每 16ms 轮询 `readFrame()` 取帧后 `putImageData`。
-- **看视频音频并行**：native 解码的同时用 `SoftVPlayer` 播放 `/api/audio?variant=remux`（DASH 最高音轨 + ffmpeg 重封装），失败自动重试两次。
-- **安全回退**：模块导入或初始化异常时自动回退原 softvideo 视频链路。
+> 主题：**修复连续播放/退出应用后的系统级崩溃**（宿主进程崩溃 → 系统 UI 重载），并降低渲染负载。
 
 ### 修复
 
-- **播放卡顿根因**：线程级采样显示旧链路 `video_decoder` 占 72–79% 单核，JS 渲染仅 17–21%；同机 ffmpeg 解同一文件仅 30%（解码）/42%（解码+RGBA），即 softvideo 低效约 5 倍。新链路把解码交给 ffmpeg。
-- **音频 remux 起播竞态**：首字节前可能报 `streamDecoder init failed`，增加两次自动重试。
+- **系统级崩溃（核心修复）**
+  - 真机表现：连续「起播 → 返回/退出应用 → 播放下一个」后，系统 UI 突然重载（宿主 falcon 进程崩溃，由 `guardian_run` 拉起），严重时触发 `runDictPen` 的连续崩溃看门狗重启。
+  - 通过 core dump（390MB，真机生成 + ARM gdb 分析）定位：崩溃发生在 JS 定时器回调 `getImageData(160,90)` → `JS_NewArrayBufferCopy` → 设备 libc 内 mimalloc 分配器，此时堆元数据已被写成 `0xFF010101`（一个近黑视频像素值）。
+  - 根因：传给 vendor `SoftVPlayer` 的 160×90 像素缓冲区（57,600 字节）在 JS 侧只是局部变量，QuickJS GC 会将其回收，而 vendor 解码线程仍持续向该内存写像素 → 踩坏 mimalloc 堆 → 之后任意一次 malloc（如图片解码 / `getImageData`）随机崩溃。
+  - 修复：JS 侧持有该缓冲区强引用（`_audioImageData`），仅在播放器 `stop()` 完成后、下次起播覆盖引用时才允许释放。
+
+- **大封面图内存压力**：远程封面统一追加 B 站图片处理后缀 `@320w_180h.jpg`（解码位图 14.7MB → 230KB），消除日志中的 `BitmapFactory: image is too too large` 告警与瞬时内存峰值。
+
+- **降低单核负载**：native 渲染上限 **24fps**（减少 1/4 的 `readFrame` 帧拷贝与 `putImageData`）；`sws_scale` 插值由 `SWS_BILINEAR` 改为 `SWS_FAST_BILINEAR`。
+
+- **停止流程简化**：不再在 `/api/stop` 时主动取消媒体流 / 暂停播放器（该顺序曾触发厂商播放器状态机异常，加重崩溃），改为依赖播放器自身 `stop()`。
 
 ### 实测
 
-- native 播放：`draws/s=25–34`（约 30fps），单帧 14–17ms，`maxgap` 58–80ms（偶发 150–394ms）。
-- 整机 CPU 55–82%（旧链路 95–98% 且仅 10–12fps）。
-- 音频正常。
+- 连续「起播 → 退出应用 → 换下一个」5–10 次：修复前必然崩溃，修复后不再崩溃（用户确认）。
+- 24fps 渲染下画面流畅度可接受；爆音/失真有所改善（用户确认）。
 
 ### 已知问题
 
-- **搜索键盘完全不可用**：该机型 miniapp 原生软键盘不弹出，自绘屏幕键盘方案也未生效，搜索页无法输入关键词（推荐流/登录/看视频/听视频正常）。
+- 音频：停止后约 1 秒尾音、偶发爆音/失真、音画同步一般（**优先级低**，见 README 的 TODO/路线图）。
+- 搜索键盘不可用（输入法问题），下载为占位按钮。
 - 尚未接入 RGA 做 YUV→RGBA 转换（当前 `sws_scale`）。
-- 「下载」为占位；扫码登录成功链路待真实扫码验证。

@@ -103,15 +103,21 @@ class BasePage extends PageRes {
   }
   onShow() {
     super.onShow();
+    console.warn('[Lifecycle] page onShow');
+    try { const vm = globalThis.__biliVm; if (vm && vm.onShow) vm.onShow(); } catch (e) {}
     if (this.$root && this.$root.onShow) this.$root.onShow();
   }
   onHide() {
-    super.onHide();
+    console.warn('[Lifecycle] page onHide');
+    try { super.onHide(); } catch (e) {}
+    try { const vm = globalThis.__biliVm; if (vm && vm.onHide) vm.onHide(); } catch (e) {}
     if (this.$root && this.$root.onHide) this.$root.onHide();
   }
   onUnload() {
+    console.warn('[Lifecycle] page onUnload');
     try {
       super.onUnload();
+      try { const vm = globalThis.__biliVm; if (vm && vm.onUnload) vm.onUnload(); } catch (e) {}
       if (this.$root && this.$root.onUnload) this.$root.onUnload();
     } finally {
       this.release();
@@ -187,10 +193,23 @@ var script = {
     };
   },
   mounted() {
+    globalThis.__biliVm = this;
     this.bootstrapDaemon();
     this.testSoftVideo();
     this.syncDaemonState();
     this.loadNativeVideo();
+  },
+  onShow() {
+    console.warn('[Lifecycle] vm onShow');
+  },
+  onHide() {
+    // 系统手势回到桌面时页面进入后台：必须立即停播放，否则音频会继续输出并残留到下一次播放。
+    console.warn('[Lifecycle] vm onHide, stop playback');
+    try { this.stop(); } catch (e) {}
+  },
+  onUnload() {
+    console.warn('[Lifecycle] vm onUnload, stop playback');
+    try { this.stop(); } catch (e) {}
   },
   methods: {
     async loadNativeVideo() {
@@ -411,11 +430,20 @@ var script = {
       const item = d.item || {};
       return item[key] !== undefined && item[key] !== null ? item[key] : '';
     },
+    thumbUrl(u) {
+      // 远程封面统一走 B 站图片处理后缀：避免解码 2558x1439 这类大图（14MB+ 位图），
+      // 那是设备内存/CPU 的压力源（日志里的 "BitmapFactory: image is too too large" 即此）。
+      // 本地缩略图（covers/xxx.jpg）直接返回。
+      if (!u) return '';
+      if (u.indexOf('http') !== 0) return u;
+      if (u.indexOf('@') >= 0) return u;
+      return u + '@320w_180h.jpg';
+    },
     detailSrc() {
       const d = this.detail || {};
       const data = d.data || {};
       const item = d.item || {};
-      return data.pic_local || data.pic || item.pic_local || item.pic || '';
+      return this.thumbUrl(data.pic_local || data.pic || item.pic_local || item.pic || '');
     },
     detailMeta() {
       const up = this.dt('owner') || '未知UP';
@@ -509,7 +537,10 @@ var script = {
       this._lastCb = 0;
       this._maxGap = 0;
       this._audioRetry = 0;
+      this._lastNativeRead = 0;
       console.warn('[Rga] play ' + item.bvid + ' dec=' + dec.w + 'x' + dec.h);
+      // 尽早在起播阶段就释放上一路音频，给 ALSA 更长的回收时间。
+      this._stopAudioOnly();
       try {
         http.request({
           url: 'http://127.0.0.1:18080/api/play?bvid=' + item.bvid + '&mode=video&title=' + encodeURIComponent(item.title || ''),
@@ -531,14 +562,18 @@ var script = {
         else if (typeof canvas.getContext === 'function') ctx = canvas.getContext('2d');
         if (!ctx) { console.warn('[Rga] no ctx'); return; }
         this.ctx = ctx;
-        this.imageData = ctx.getImageData(0, 0, dec.w, dec.h);
+        const sizeKey = dec.w + 'x' + dec.h;
+        if (!this.imageData || this._imageSize !== sizeKey) {
+          this.imageData = ctx.getImageData(0, 0, dec.w, dec.h);
+          this._imageSize = sizeKey;
+        }
         if (!this.imageData || !this.imageData.data || !this.imageData.data.buffer) {
           console.warn('[Rga] no imageData');
           return;
         }
         this.rgav.setBuffer(this.imageData.data.buffer, dec.w, dec.h);
         this.rgav.start('http://127.0.0.1:18080/api/stream?bvid=' + item.bvid);
-        console.warn('[Rga] started');
+        console.warn('[Rga] video started');
         this._startNativeAudio(gen, item);
         if (this._vidTimer) this.$page.clearInterval(this._vidTimer);
         this._vidTimer = this.$page.setInterval(() => {
@@ -554,7 +589,11 @@ var script = {
     },
     _nativeTick(gen, ctx) {
       try {
-        const t0 = Date.now();
+        const now = Date.now();
+        // 降渲染负载：24fps 上限，同时减少 readFrame 的 921KB 内存拷贝次数。
+        if (now - (this._lastNativeRead || 0) < 41) return;
+        this._lastNativeRead = now;
+        const t0 = now;
         const got = this.rgav.readFrame();
         if (got) {
           ctx.putImageData(this.imageData, 0, 0);
@@ -590,57 +629,61 @@ var script = {
       }
     },
     _startNativeAudio(gen, item) {
-      try {
-        if (this.audioPlayer) {
-          try { this.audioPlayer.stop(); } catch (e) {}
-          this.audioPlayer = null;
-        }
-        const ac = this.$refs.aCanvas;
-        if (!ac) { console.warn('[Rga] no audio canvas'); return; }
-        let actx = null;
-        if (typeof createCanvasContext === 'function') actx = createCanvasContext(ac);
-        else if (typeof ac.getContext === 'function') actx = ac.getContext('2d');
-        if (!actx) { console.warn('[Rga] no audio ctx'); return; }
-        const PlayerClass = (softvplayer && softvplayer.SoftVPlayer) || (softvplayer && softvplayer.default && softvplayer.default.SoftVPlayer) || softvplayer;
-        if (typeof PlayerClass !== 'function') return;
-        const ap = new PlayerClass();
-        this.audioPlayer = ap;
-        const adata = actx.getImageData(0, 0, 160, 90);
-        ap.setVideoInfo(160, 90);
-        if (adata && adata.data) ap.setImageDataBuffer(adata.data.buffer);
-        this._audioBind = [];
-        const bind = (name, cb) => {
-          try {
-            const sig = ap[name];
-            if (sig && typeof sig.on === 'function') {
-              const tok = sig.on(cb);
-              this._audioBind.push({ sig: sig, token: tok });
+      // 先彻底释放上一路音频：softvideo 的 stop 会 closeAudioDevice，需要时间让 ALSA 回收。
+      // 连续起播时如果马上新建播放器，会出现两路音频抢设备 → 爆音/吱吱声。
+      this._stopAudioOnly();
+      const elapsed = this._audioStoppedAt ? (Date.now() - this._audioStoppedAt) : 1e9;
+      const wait = Math.max(0, 500 - elapsed);
+      this.$page.setTimeout(() => {
+        if (gen !== this.playGen || !this.isPlaying || this.isStopping) return;
+        try {
+          const ac = this.$refs.aCanvas;
+          if (!ac) { console.warn('[Rga] no audio canvas'); return; }
+          let actx = null;
+          if (typeof createCanvasContext === 'function') actx = createCanvasContext(ac);
+          else if (typeof ac.getContext === 'function') actx = ac.getContext('2d');
+          if (!actx) { console.warn('[Rga] no audio ctx'); return; }
+          const PlayerClass = (softvplayer && softvplayer.SoftVPlayer) || (softvplayer && softvplayer.default && softvplayer.default.SoftVPlayer) || softvplayer;
+          if (typeof PlayerClass !== 'function') return;
+          const ap = new PlayerClass();
+          this.audioPlayer = ap;
+          const adata = actx.getImageData(0, 0, 160, 90);
+          // ★ 关键修复：native 侧只保存裸指针，JS 必须持有该 ArrayBuffer 的强引用，
+          // 否则 QuickJS GC 回收后 vendor 解码线程仍往这块内存写像素 → 踩坏 mimalloc 堆，
+          // 表现为之后任意 malloc（如图片解码/getImageData）随机崩溃。已用 core dump 证实。
+          this._audioImageData = adata;
+          this._audioBuffer = (adata && adata.data) ? adata.data.buffer : null;
+          ap.setVideoInfo(160, 90);
+          if (adata && adata.data) ap.setImageDataBuffer(adata.data.buffer);
+          this._audioBind = [];
+          const bind = (name, cb) => {
+            try {
+              const sig = ap[name];
+              if (sig && typeof sig.on === 'function') {
+                const tok = sig.on(cb);
+                this._audioBind.push({ sig: sig, token: tok });
+              }
+            } catch (e) {}
+          };
+          bind('onError', (c) => {
+            console.warn('[Rga] audio error ' + c);
+            // remux 刚启动时首字节可能还没到，软解会 avformat_open_input 失败：自动重试两次。
+            if ((this._audioRetry || 0) < 2) {
+              this._audioRetry = (this._audioRetry || 0) + 1;
+              this.$page.setTimeout(() => {
+                if (gen === this.playGen && this.isPlaying) this._startNativeAudio(gen, item);
+              }, 1200);
             }
-          } catch (e) {}
-        };
-        bind('onError', (c) => {
-          console.warn('[Rga] audio error ' + c);
-          // remux 刚启动时首字节可能还没到，软解会 avformat_open_input 失败：自动重试两次。
-          if ((this._audioRetry || 0) < 2) {
-            this._audioRetry = (this._audioRetry || 0) + 1;
-            this.$page.setTimeout(() => {
-              if (gen === this.playGen && this.isPlaying) this._startNativeAudio(gen, item);
-            }, 1200);
-          }
-        });
-        ap.start('http://127.0.0.1:18080/api/audio?bvid=' + item.bvid + '&variant=remux');
-        console.warn('[Rga] audio started');
-      } catch (e) {
-        console.warn('[Rga] audio init error: ' + e);
-      }
-    },
-    _stopNative() {
-      try {
-        if (this._vidTimer) {
-          this.$page.clearInterval(this._vidTimer);
-          this._vidTimer = null;
+          });
+          ap.start('http://127.0.0.1:18080/api/audio?bvid=' + item.bvid + '&variant=remux');
+          console.warn('[Rga] audio started, pause=' + (typeof ap.pause));
+        } catch (e) {
+          console.warn('[Rga] audio init error: ' + e);
         }
-      } catch (e) {}
+      }, wait);
+    },
+    _stopAudioOnly() {
+      let stopped = false;
       try {
         if (this._audioBind) {
           for (let i = 0; i < this._audioBind.length; i++) {
@@ -654,8 +697,24 @@ var script = {
         if (this.audioPlayer) {
           this.audioPlayer.stop();
           this.audioPlayer = null;
+          stopped = true;
         }
       } catch (e) {}
+      if (stopped) {
+        this._audioStoppedAt = Date.now();
+        // 注意：这里不立即释放 this._audioImageData / this._audioBuffer。
+        // 它们的强引用会在下一次 _startNativeAudio 覆盖时自然释放（那时旧播放器已 stop 并 join），
+        // 避免极端时序下 vendor 内部线程仍在收尾而缓冲区已被 GC 回收。
+      }
+    },
+    _stopNative() {
+      try {
+        if (this._vidTimer) {
+          this.$page.clearInterval(this._vidTimer);
+          this._vidTimer = null;
+        }
+      } catch (e) {}
+      this._stopAudioOnly();
       try {
         if (this.rgav) this.rgav.stop();
       } catch (e) {}
@@ -967,6 +1026,14 @@ var script = {
     async stop() {
       if (this.isStopping) return;
       this.isStopping = true;
+      // 先让 daemon 取消音频/视频流：解码线程才能尽快退出，否则 stop() 会等网络读超时，声音拖尾约 1s。
+      try {
+        http.request({
+          url: 'http://127.0.0.1:18080/api/stop',
+          method: 'GET',
+          timeout: 500
+        }).catch(() => {});
+      } catch (e) {}
       this._stopNative();
       const gen = this.playGen || 0;
       this.statusText = '正在退出播放...';
@@ -994,14 +1061,6 @@ var script = {
           console.warn("[SoftVPlayer] vPlayer.stop error:", e);
         }
       }
-      try {
-        http.request({
-          url: 'http://127.0.0.1:18080/api/stop',
-          method: 'GET',
-          timeout: 500
-        }).catch(() => {});
-      } catch (e) {}
-
       this.$page.setTimeout(() => {
         if (gen !== (this.playGen || 0)) {
           console.warn("[SoftVPlayer] teardown skipped: newer play started (#" + gen + " -> #" + this.playGen + ")");
@@ -1009,6 +1068,7 @@ var script = {
         }
         this.vPlayer = null;
         this.imageData = null;
+        this._imageSize = '';
         this.isPlaying = false;
         this.audioMode = false;
         this.currentTitle = '';
@@ -1708,7 +1768,7 @@ var render = function () {
           }, [
             _c('image', {
               staticClass: ["card-thumb"],
-              attrs: { "src": item.pic_local || item.pic }
+              attrs: { "src": _vm.thumbUrl(item.pic_local || item.pic) }
             }),
             _c('div', { staticClass: ["card-info"] }, [
               _c('text', { staticClass: ["video-card-title"] }, [_vm._v(_vm._s(item.title))]),
@@ -1734,7 +1794,7 @@ var render = function () {
           }, [
             _c('image', {
               staticClass: ["card-thumb"],
-              attrs: { "src": item.pic_local || item.pic }
+              attrs: { "src": _vm.thumbUrl(item.pic_local || item.pic) }
             }),
             _c('div', { staticClass: ["card-info"] }, [
               _c('text', { staticClass: ["video-card-title"] }, [_vm._v(_vm._s(item.title))]),
@@ -1941,7 +2001,7 @@ App$1.meta = {
   }
 };
 App$1.meta.name = '笔上哔哩';
-App$1.meta.version = '2.2.0';
+App$1.meta.version = '2.2.1';
 App$1.meta.isSingleJsBundle = false;
 $falcon.__AppClazz = App$1;
 $falcon.__loadModuleDefault = async function (fileName) {
@@ -1967,7 +2027,7 @@ with open(os.path.join(PKG_DIR, "app.js"), "w", encoding="utf-8") as f:
 # 4. Manifest template
 manifest = {
     "appName": "笔上哔哩",
-    "version": "2.2.0",
+    "version": "2.2.1",
     "appid": "9002000869905604",
     "icon": "app_icon.png",
     "quickjs": {

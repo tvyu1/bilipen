@@ -112,7 +112,7 @@ static void *decode_main(void *arg) {
     frm = av_frame_alloc();
     sws = sws_getContext(p->src_w, p->src_h, dec->pix_fmt,
                          p->out_w, p->out_h, AV_PIX_FMT_RGBA,
-                         SWS_BILINEAR, NULL, NULL, NULL);
+                         SWS_FAST_BILINEAR, NULL, NULL, NULL);
     if (!pkt || !frm || !sws) {
         set_err(p, "alloc=%d", -3);
         goto done;
