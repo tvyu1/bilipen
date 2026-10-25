@@ -27,7 +27,7 @@ def build_daemon():
         return
     env = dict(os.environ)
     env.update({"GOOS": "linux", "GOARCH": "arm", "GOARM": "7", "CGO_ENABLED": "0"})
-    cmd = [go, "build", "-trimpath", "-ldflags", "-s -w -buildid=", "-o", out, "main.go"]
+    cmd = [go, "build", "-trimpath", "-ldflags", "-s -w -buildid=", "-o", out, "."]
     subprocess.run(cmd, cwd=src_dir, env=env, check=True)
     print("[Build] bili-daemon = %d bytes" % os.path.getsize(out))
 
@@ -68,7 +68,7 @@ print("[Build] app.js copied from frontend/app.js (%d bytes)" % os.path.getsize(
 # 4. Manifest template
 manifest = {
     "appName": "笔上哔哩",
-    "version": "2.4.2",
+    "version": "2.4.3",
     "appid": "9002000869905604",
     "icon": "app_icon.png",
     "quickjs": {

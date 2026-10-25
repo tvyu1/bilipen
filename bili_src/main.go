@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version     = "2.4.2"
+	Version     = "2.4.3"
 
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
@@ -533,7 +533,7 @@ func idleWatchdog(server *http.Server) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 	for range ticker.C {
-		if playbackActive() {
+		if playbackActive() || downloadActive() {
 			updateActivity()
 			continue
 		}
@@ -561,6 +561,7 @@ func handleHistoryClear(w http.ResponseWriter, r *http.Request) {
 func main() {
 	_ = os.MkdirAll(CoverDir, 0755)
 	loadHistory()
+	loadDownloads()
 	log.Printf("[BiliDaemon] Starting v%s on 127.0.0.1:%d ...", Version, Port)
 
 	go cleanCache()
@@ -584,6 +585,12 @@ func main() {
 	mux.HandleFunc("/api/history", handleHistoryList)
 	mux.HandleFunc("/api/history/add", handleHistoryAdd)
 	mux.HandleFunc("/api/history/clear", handleHistoryClear)
+
+	// Download
+	mux.HandleFunc("/api/download/start", handleDownloadStart)
+	mux.HandleFunc("/api/download/list", handleDownloadList)
+	mux.HandleFunc("/api/download/status", handleDownloadStatus)
+	mux.HandleFunc("/api/download/delete", handleDownloadDelete)
 
 	// User & Login
 	mux.HandleFunc("/api/user/info", handleUserInfo)
@@ -2003,6 +2010,11 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "invalid bvid", 400)
 		return
 	}
+	offlinePath := filepath.Join(DownloadDir, bvid+".mp4")
+	if fileExists(offlinePath) {
+		http.ServeFile(w, r, offlinePath)
+		return
+	}
 	s, err := ensureSpool(bvid)
 	if err != nil {
 		atomic.AddInt64(&cacheFallbacks, 1)
@@ -2026,6 +2038,27 @@ func handleDetail(w http.ResponseWriter, r *http.Request) {
 	}
 	meta, err := resolveMeta(bvid)
 	if err != nil {
+		dlMu.Lock()
+		dlItem := dlItems[bvid]
+		dlMu.Unlock()
+		if dlItem != nil && dlItem.Status == "completed" {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"bvid":      bvid,
+				"title":     dlItem.Title,
+				"owner":     dlItem.Owner,
+				"pic":       dlItem.Pic,
+				"pic_local": dlItem.PicLocal,
+				"duration":  dlItem.Duration,
+				"desc":      "离线已下载视频",
+				"view":      0,
+				"like":      0,
+				"danmaku":   0,
+				"cid":       0,
+				"dimension": map[string]int{"width": 640, "height": 360},
+			})
+			return
+		}
 		log.Printf("[BiliDaemon] detail failed for %s: %v", bvid, err)
 		jsonError(w, "detail: "+err.Error(), 502)
 		return
@@ -2067,6 +2100,11 @@ func handleAudio(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validBVID(bvid) {
 		jsonError(w, "invalid bvid", 400)
+		return
+	}
+	offlinePath := filepath.Join(DownloadDir, bvid+".mp4")
+	if fileExists(offlinePath) {
+		handleLocalAudioRemux(w, r, bvid, offlinePath)
 		return
 	}
 	au, err := resolveAudio(bvid)

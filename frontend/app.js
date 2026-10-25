@@ -138,6 +138,10 @@ var script = {
       // History（观看历史，持久化在 daemon 侧）
       history: [],
       loadingHistory: false,
+      // Downloads（离线下载）
+      downloads: [],
+      downloadFreeText: '',
+      detailDownload: { status: 'none', progress: 0, text: '⬇ 下载' },
       // 版本号（从 daemon /api/ping 取，显示在「我的」页）
       appVersion: '',
       // Player
@@ -282,6 +286,8 @@ var script = {
         }
       } else if (tab === 'history') {
         this.fetchHistory();
+      } else if (tab === 'download') {
+        this.fetchDownloads();
       }
     },
     historyTime(ts) {
@@ -679,6 +685,117 @@ var script = {
       if (v >= 10000) return (v / 10000).toFixed(1) + '万';
       return String(v);
     },
+    formatBytes(bytes) {
+      const b = Number(bytes) || 0;
+      if (b <= 0) return '0 B';
+      if (b >= 1073741824) return (b / 1073741824).toFixed(1) + ' GB';
+      if (b >= 1048576) return (b / 1048576).toFixed(1) + ' MB';
+      if (b >= 1024) return (b / 1024).toFixed(0) + ' KB';
+      return b + ' B';
+    },
+    async fetchDownloads() {
+      try {
+        const res = await http.request({
+          url: 'http://127.0.0.1:18080/api/download/list',
+          method: 'GET',
+          timeout: 4000
+        });
+        const data = safeJson(res.body, {});
+        if (data && data.items) {
+          this.downloads = data.items;
+          this.downloadFreeText = data.free_text || '';
+          const hasActive = this.downloads.some(d => d.status === 'downloading' || d.status === 'pending');
+          if (hasActive && this.currentTab === 'download') {
+            if (this._dlListTimer) this.$page.clearTimeout(this._dlListTimer);
+            this._dlListTimer = this.$page.setTimeout(() => {
+              if (this.currentTab === 'download') this.fetchDownloads();
+            }, 1200);
+          }
+        }
+      } catch (e) {
+        console.warn('[Download] fetch error: ' + e);
+      }
+    },
+    async checkDetailDownload(bvid) {
+      if (!bvid) return;
+      try {
+        const res = await http.request({
+          url: 'http://127.0.0.1:18080/api/download/status?bvid=' + bvid,
+          method: 'GET',
+          timeout: 3000
+        });
+        const data = safeJson(res.body, {});
+        if (data && data.status) {
+          this.updateDownloadStatus(data.status, data.item);
+          if (data.status === 'downloading' || data.status === 'pending') {
+            if (this._dlDetailTimer) this.$page.clearTimeout(this._dlDetailTimer);
+            this._dlDetailTimer = this.$page.setTimeout(() => {
+              if (this.currentView === 'detail' && this.detailItem() && this.detailItem().bvid === bvid) {
+                this.checkDetailDownload(bvid);
+              }
+            }, 1200);
+          }
+        }
+      } catch (e) {}
+    },
+    updateDownloadStatus(status, item) {
+      if (status === 'completed') {
+        this.detailDownload = { status: 'completed', progress: 100, text: '✓ 离线可用' };
+      } else if (status === 'downloading') {
+        const prog = (item && item.progress) || 0;
+        this.detailDownload = { status: 'downloading', progress: prog, text: '⏳ 下载中 ' + prog + '%' };
+      } else if (status === 'pending') {
+        this.detailDownload = { status: 'pending', progress: 0, text: '⏳ 排队中...' };
+      } else {
+        this.detailDownload = { status: 'none', progress: 0, text: '⬇ 下载' };
+      }
+    },
+    async onDetailDownloadClick() {
+      const item = this.detailItem();
+      if (!item || !item.bvid) return;
+      if (this.detailDownload.status === 'completed') {
+        this.showToast('视频已下载，支持完全离线播放');
+        return;
+      }
+      if (this.detailDownload.status === 'downloading' || this.detailDownload.status === 'pending') {
+        this.showToast('正在下载中: ' + (this.detailDownload.progress || 0) + '%');
+        return;
+      }
+      this.showToast('已加入离线下载队列');
+      this.detailDownload = { status: 'downloading', progress: 0, text: '⏳ 启动中...' };
+      try {
+        const res = await http.request({
+          url: 'http://127.0.0.1:18080/api/download/start?bvid=' + item.bvid,
+          method: 'GET',
+          timeout: 6000
+        });
+        const data = safeJson(res.body, {});
+        if (data && data.status) {
+          this.updateDownloadStatus(data.status, data.item);
+          this.checkDetailDownload(item.bvid);
+        }
+      } catch (e) {
+        this.showToast('下载请求失败');
+        this.detailDownload = { status: 'none', progress: 0, text: '⬇ 下载' };
+      }
+    },
+    async deleteDownload(bvid) {
+      if (!bvid) return;
+      try {
+        await http.request({
+          url: 'http://127.0.0.1:18080/api/download/delete?bvid=' + bvid,
+          method: 'GET',
+          timeout: 4000
+        });
+        this.showToast('已删除离线文件');
+        this.fetchDownloads();
+        if (this.currentView === 'detail' && this.detailItem() && this.detailItem().bvid === bvid) {
+          this.detailDownload = { status: 'none', progress: 0, text: '⬇ 下载' };
+        }
+      } catch (e) {
+        this.showToast('删除失败');
+      }
+    },
     dt(key) {
       const d = this.detail || {};
       const data = d.data || {};
@@ -713,6 +830,8 @@ var script = {
       if (this.isPlaying) this.stop();
       this.currentView = 'detail';
       this.detail = { item: item, data: null, loading: true, error: '' };
+      this.detailDownload = { status: 'none', progress: 0, text: '⬇ 下载' };
+      this.checkDetailDownload(item.bvid);
       this.statusText = '加载视频详情...';
       console.warn('[Detail] open ' + item.bvid);
       try {
@@ -737,6 +856,10 @@ var script = {
     closeDetail() {
       this.currentView = 'home';
       this.detail = null;
+      if (this._dlDetailTimer) {
+        this.$page.clearTimeout(this._dlDetailTimer);
+        this._dlDetailTimer = null;
+      }
     },
     detailItem() {
       return (this.detail && this.detail.item) ? this.detail.item : null;
@@ -1521,11 +1644,11 @@ var style_0 = { "_": {
     "flexDirection": "column"
   },
   "nav-btn": {
-    "height": "25px",
+    "height": "22px",
     "borderRadius": "4px",
     "justifyContent": "center",
     "alignItems": "center",
-    "marginBottom": "4px",
+    "marginBottom": "3px",
     "backgroundColor": "#1e2127"
   },
   "nav-btn-active": {
@@ -2053,6 +2176,26 @@ var style_0 = { "_": {
   "detail-btn-text-dl": {
     "color": "#99a2aa"
   },
+  "detail-btn-dl-done": {
+    "backgroundColor": "#16382b",
+    "borderWidth": "1px",
+    "borderStyle": "solid",
+    "borderColor": "#00e676"
+  },
+  "detail-btn-text-done": {
+    "color": "#00e676"
+  },
+  "detail-btn-delete": {
+    "backgroundColor": "#3a1d24",
+    "borderWidth": "1px",
+    "borderStyle": "solid",
+    "borderColor": "#fb7299",
+    "paddingLeft": "8px",
+    "paddingRight": "8px"
+  },
+  "detail-btn-text-delete": {
+    "color": "#fb7299"
+  },
   "toast-box": {
     "position": "absolute",
     "left": "150px",
@@ -2154,6 +2297,17 @@ var render = function () {
         ]),
         _c('div', {
           staticClass: ["nav-btn"],
+          class: [_vm.currentTab === 'download' ? 'nav-btn-active' : ''],
+          on: { "click": function () { _vm.switchTab('download'); } }
+        }, [
+          _c('text', {
+            staticClass: ["nav-btn-text"],
+            class: [_vm.currentTab === 'download' ? 'nav-btn-text-active' : ''],
+            on: { "click": function () { _vm.switchTab('download'); } }
+          }, [_vm._v("下载")])
+        ]),
+        _c('div', {
+          staticClass: ["nav-btn"],
           class: [_vm.currentTab === 'search' ? 'nav-btn-active' : ''],
           on: { "click": function () { _vm.switchTab('search'); } }
         }, [
@@ -2186,7 +2340,7 @@ var render = function () {
             staticClass: ["btn-change"],
             on: { "click": _vm.fetchFeed }
           }, [
-            _c('text', { staticClass: ["btn-change-text"] }, [_vm._v("换一换 🔄")])
+            _c('text', { staticClass: ["btn-change-text"] }, [_vm._v("换一换")])
           ])
         ]) : (_vm.currentTab === 'search') ? _c('div', { staticClass: ["banner", "search-banner"] }, [
           _c('div', { staticClass: ["search-input"], on: { "click": _vm.openKeyboard } }, [
@@ -2205,7 +2359,12 @@ var render = function () {
         ]) : (_vm.currentTab === 'history') ? _c('div', { staticClass: ["banner"] }, [
           _c('text', { staticClass: ["banner-text"] }, [_vm._v("观看历史 · " + _vm._s(_vm.history.length) + " 条")]),
           _c('div', { staticClass: ["btn-change"], on: { "click": _vm.clearHistory } }, [
-            _c('text', { staticClass: ["btn-change-text"] }, [_vm._v("清空 🗑")])
+            _c('text', { staticClass: ["btn-change-text"] }, [_vm._v("清空")])
+          ])
+        ]) : (_vm.currentTab === 'download') ? _c('div', { staticClass: ["banner"] }, [
+          _c('text', { staticClass: ["banner-text"] }, [_vm._v("离线下载 · " + _vm._s(_vm.downloads.length) + " 部" + (_vm.downloadFreeText ? (" · 剩余空间 " + _vm.downloadFreeText) : ""))]),
+          _c('div', { staticClass: ["btn-change"], on: { "click": _vm.fetchDownloads } }, [
+            _c('text', { staticClass: ["btn-change-text"] }, [_vm._v("刷新")])
           ])
         ]) : _c('div', { staticClass: ["banner"] }, [
           _c('text', { staticClass: ["banner-text"] }, [_vm._v("哔哩哔哩账号中心")])
@@ -2261,6 +2420,37 @@ var render = function () {
           ]);
         })) : _c('div', { staticClass: ["banner"] }, [
           _c('text', { staticClass: ["banner-text"] }, [_vm._v("暂无观看历史，播放过的视频会出现在这里")])
+        ])) : _vm._e(),
+
+        // Tab: Download（离线下载）
+        (_vm.currentTab === 'download') ? (_vm.downloads.length > 0 ? _c('scroller', {
+          staticClass: ["card-scroller"],
+          style: { "height": "146px" },
+          attrs: { "scrollDirection": "horizontal" }
+        }, _vm._l(_vm.downloads, function (item, index) {
+          return _c('div', {
+            key: item.bvid,
+            staticClass: ["video-card"],
+            style: { "height": "138px" },
+            on: { "click": function ($event) { _vm.openDetail({ bvid: item.bvid, title: item.title, pic: item.pic, pic_local: item.pic_local }); } }
+          }, [
+            _c('image', {
+              staticClass: ["card-thumb"],
+              attrs: { "src": _vm.thumbUrl(item.pic_local || item.pic) }
+            }),
+            _c('div', { staticClass: ["card-info"] }, [
+              _c('text', { staticClass: ["video-card-title"] }, [_vm._v(_vm._s(item.title) || item.bvid)]),
+              _c('div', { staticClass: ["video-card-footer"] }, [
+                _c('text', { staticClass: ["video-card-owner"] }, [_vm._v(item.status === 'completed' ? _vm.formatBytes(item.total_bytes) : (item.status === 'downloading' ? (item.progress + '%') : '排队中'))]),
+                _c('text', {
+                  staticClass: ["video-card-action"],
+                  style: { color: item.status === 'completed' ? '#00e676' : '#fb7299' }
+                }, [_vm._v(item.status === 'completed' ? "离线播放" : "下载中")])
+              ])
+            ])
+          ]);
+        })) : _c('div', { staticClass: ["banner"] }, [
+          _c('text', { staticClass: ["banner-text"] }, [_vm._v("暂无离线内容，在任意视频详情页点击「下载」即可离线观看")])
         ])) : _vm._e(),
 
         // Tab 2: Search
@@ -2351,17 +2541,27 @@ var render = function () {
           (_vm.detail.error) ? _c('text', { staticClass: ["detail-error"] }, [_vm._v(_vm._s(_vm.detail.error))]) : _vm._e(),
           _c('div', { staticClass: ["detail-actions"] }, [
             _c('div', { staticClass: ["detail-btn", "detail-btn-play"], on: { "click": _vm.startVideo } }, [
-              _c('text', { staticClass: ["detail-btn-text"] }, [_vm._v("▶ 看视频")])
+              _c('text', { staticClass: ["detail-btn-text"] }, [_vm._v("看视频")])
             ]),
             _c('div', { staticClass: ["detail-btn", "detail-btn-audio"], on: { "click": _vm.startAudio } }, [
-              _c('text', { staticClass: ["detail-btn-text"] }, [_vm._v("🎧 听视频")])
+              _c('text', { staticClass: ["detail-btn-text"] }, [_vm._v("听视频")])
             ]),
             _c('div', {
               staticClass: ["detail-btn", "detail-btn-dl"],
-              on: { "click": function () { _vm.showToast('下载功能占位，暂未开放'); } }
+              class: [_vm.detailDownload.status === 'completed' ? 'detail-btn-dl-done' : ''],
+              on: { "click": _vm.onDetailDownloadClick }
             }, [
-              _c('text', { staticClass: ["detail-btn-text", "detail-btn-text-dl"] }, [_vm._v("⬇ 下载")])
-            ])
+              _c('text', {
+                staticClass: ["detail-btn-text", "detail-btn-text-dl"],
+                class: [_vm.detailDownload.status === 'completed' ? 'detail-btn-text-done' : '']
+              }, [_vm._v(_vm.detailDownload.text || "⬇ 下载")])
+            ]),
+            (_vm.detailDownload.status === 'completed') ? _c('div', {
+              staticClass: ["detail-btn", "detail-btn-delete"],
+              on: { "click": function () { _vm.deleteDownload(_vm.detailItem() ? _vm.detailItem().bvid : ''); } }
+            }, [
+              _c('text', { staticClass: ["detail-btn-text", "detail-btn-text-delete"] }, [_vm._v("删除")])
+            ]) : _vm._e()
           ])
         ])
       ]),
@@ -2419,7 +2619,7 @@ var render = function () {
         ])
       ]) : _vm._e(),
       _c('div', { staticClass: ["player-header"] }, [
-        _c('text', { staticClass: ["banner-text"], style: { maxWidth: '420px' } }, [_vm._v((_vm.audioMode ? "🎧 " : "▶ ") + _vm._s(_vm.currentTitle))]),
+        _c('text', { staticClass: ["banner-text"], style: { maxWidth: '420px' } }, [_vm._v((_vm.audioMode ? "[音频] " : "[视频] ") + _vm._s(_vm.currentTitle))]),
         _c('div', { staticClass: ["player-actions"] }, [
           _c('div', {
             staticClass: ["btn-exit"],
