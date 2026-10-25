@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,7 +30,8 @@ import (
 )
 
 const (
-	Version     = "2.4.1"
+	Version     = "2.4.2"
+
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
 	UserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -55,6 +58,17 @@ const (
 	AudioIdleTimeout    = 30 * time.Second
 	CacheMaxAgeSecond   = int64(7 * 24 * 3600)
 )
+
+func writeJSON(w http.ResponseWriter, code int, v interface{}) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func jsonError(w http.ResponseWriter, msg string, code int) {
+	writeJSON(w, code, map[string]interface{}{"error": msg, "code": code})
+}
+
 
 type VideoItem struct {
 	Bvid     string `json:"bvid"`
@@ -174,6 +188,115 @@ var (
 
 	// API 请求客户端（B 站 Web 接口，短请求）
 	apiClient = &http.Client{Timeout: 8 * time.Second}
+)
+
+// WBI 签名算法实现（防止 B 站接口命中 -412 风控）
+var mixinKeyEncTab = []int{
+	46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49,
+	33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40,
+	61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11,
+	36, 20, 34, 44, 52,
+}
+
+var (
+	wbiKeyMu      sync.RWMutex
+	wbiMixinKey   string
+	wbiKeyExpires time.Time
+)
+
+func getMixinKey(raw string) string {
+	var sb strings.Builder
+	for _, idx := range mixinKeyEncTab[:32] {
+		if idx < len(raw) {
+			sb.WriteByte(raw[idx])
+		}
+	}
+	return sb.String()
+}
+
+func updateWbiKeysFromNav(imgURL, subURL string) {
+	getFilename := func(u string) string {
+		parts := strings.Split(u, "/")
+		if len(parts) == 0 {
+			return ""
+		}
+		fn := parts[len(parts)-1]
+		return strings.TrimSuffix(fn, filepath.Ext(fn))
+	}
+	ik := getFilename(imgURL)
+	sk := getFilename(subURL)
+	if ik == "" || sk == "" {
+		return
+	}
+	raw := ik + sk
+	wbiKeyMu.Lock()
+	wbiMixinKey = getMixinKey(raw)
+	wbiKeyExpires = time.Now().Add(12 * time.Hour)
+	wbiKeyMu.Unlock()
+	log.Printf("[BiliDaemon] updated WBI mixin key")
+}
+
+func fetchWbiKeys() {
+	req, err := http.NewRequest("GET", "https://api.bilibili.com/x/web-interface/nav", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Referer", BiliReferer)
+	if c := loadCookie(); c != "" {
+		req.Header.Set("Cookie", c)
+	}
+	resp, err := apiClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+	var nav struct {
+		Data struct {
+			WbiImg struct {
+				ImgURL string `json:"img_url"`
+				SubURL string `json:"sub_url"`
+			} `json:"wbi_img"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&nav); err == nil {
+		if nav.Data.WbiImg.ImgURL != "" {
+			updateWbiKeysFromNav(nav.Data.WbiImg.ImgURL, nav.Data.WbiImg.SubURL)
+		}
+	}
+}
+
+func signWbiQuery(params url.Values) string {
+	wbiKeyMu.RLock()
+	mixin := wbiMixinKey
+	expires := wbiKeyExpires
+	wbiKeyMu.RUnlock()
+
+	if mixin == "" || time.Now().After(expires) {
+		mixin = "ea1db137cde3a7e728246b3ebd12cbd0"
+	}
+
+	params.Set("wts", strconv.FormatInt(time.Now().Unix(), 10))
+
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	var parts []string
+	r := strings.NewReplacer("!", "", "'", "", "(", "", ")", "", "*", "")
+	for _, k := range keys {
+		v := r.Replace(params.Get(k))
+		parts = append(parts, url.QueryEscape(k)+"="+url.QueryEscape(v))
+	}
+	queryStr := strings.Join(parts, "&")
+	hash := md5.Sum([]byte(queryStr + mixin))
+	wRid := hex.EncodeToString(hash[:])
+	return queryStr + "&w_rid=" + wRid
+}
+
+var (
 
 	// 媒体流客户端：不设整体 Timeout（否则长视频必然被截断），
 	// 只限制连接与响应头阶段，body 阶段用 StreamIdleTimeout 看门狗。
@@ -342,7 +465,7 @@ func handleHistoryAdd(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	bvid := q.Get("bvid")
 	if bvid == "" || !validBVID(bvid) {
-		http.Error(w, "bad bvid", 400)
+		jsonError(w, "bad bvid", 400)
 		return
 	}
 	title := q.Get("title")
@@ -398,6 +521,34 @@ func handleHistoryList(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"items": out})
 }
 
+
+var lastActivityAtomic int64
+
+func updateActivity() {
+	atomic.StoreInt64(&lastActivityAtomic, time.Now().Unix())
+}
+
+func idleWatchdog(server *http.Server) {
+	updateActivity()
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		if playbackActive() {
+			updateActivity()
+			continue
+		}
+		last := atomic.LoadInt64(&lastActivityAtomic)
+		idleDuration := time.Since(time.Unix(last, 0))
+		if idleDuration > 5*time.Minute {
+			log.Printf("[BiliDaemon] idle for %v without requests and not playing. Exiting to save battery...", idleDuration)
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_ = server.Shutdown(ctx)
+			cancel()
+			os.Exit(0)
+		}
+	}
+}
+
 func handleHistoryClear(w http.ResponseWriter, r *http.Request) {
 	historyMu.Lock()
 	historyItems = nil
@@ -440,11 +591,26 @@ func main() {
 	mux.HandleFunc("/api/login/poll", handleLoginPoll)
 	mux.HandleFunc("/api/login/logout", handleLogout)
 
+	wrappedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		updateActivity()
+		mux.ServeHTTP(w, r)
+	})
+
 	server := &http.Server{
 		Addr:              fmt.Sprintf("127.0.0.1:%d", Port),
-		Handler:           mux,
+		Handler:           wrappedHandler,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
+
+	go idleWatchdog(server)
+	go fetchWbiKeys()
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			cleanCache()
+		}
+	}()
 	log.Printf("[BiliDaemon] listening, tinymix=%s coverDir=%s", TinymixPath, CoverDir)
 
 	if err := server.ListenAndServe(); err != nil {
@@ -508,6 +674,10 @@ func handleUserInfo(w http.ResponseWriter, r *http.Request) {
 			Uname   string `json:"uname"`
 			Mid     int64  `json:"mid"`
 			Face    string `json:"face"`
+			WbiImg  struct {
+				ImgURL string `json:"img_url"`
+				SubURL string `json:"sub_url"`
+			} `json:"wbi_img"`
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&nav); err != nil {
@@ -515,6 +685,10 @@ func handleUserInfo(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"logged_in": false, "error": "decode nav: " + err.Error()})
 		return
+	}
+
+	if nav.Data.WbiImg.ImgURL != "" {
+		updateWbiKeysFromNav(nav.Data.WbiImg.ImgURL, nav.Data.WbiImg.SubURL)
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -540,13 +714,13 @@ func handleUserInfo(w http.ResponseWriter, r *http.Request) {
 func handleLoginQr(w http.ResponseWriter, r *http.Request) {
 	req, err := http.NewRequestWithContext(r.Context(), "GET", "https://passport.bilibili.com/x/passport-login/web/qrcode/generate", nil)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		jsonError(w, err.Error(), 500)
 		return
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	resp, err := apiClient.Do(req)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		jsonError(w, err.Error(), 500)
 		return
 	}
 	defer resp.Body.Close()
@@ -575,7 +749,7 @@ func handleLoginQr(w http.ResponseWriter, r *http.Request) {
 	qrPath := fmt.Sprintf("%s/%s", CoverDir, qrName)
 	err = qrcode.WriteFile(res.Data.Url, qrcode.Medium, 120, qrPath)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		jsonError(w, err.Error(), 500)
 		return
 	}
 
@@ -596,13 +770,13 @@ func handleLoginPoll(w http.ResponseWriter, r *http.Request) {
 	pollUrl := fmt.Sprintf("https://passport.bilibili.com/x/passport-login/web/qrcode/poll?qrcode_key=%s", url.QueryEscape(key))
 	req, err := http.NewRequestWithContext(r.Context(), "GET", pollUrl, nil)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		jsonError(w, err.Error(), 500)
 		return
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	resp, err := apiClient.Do(req)
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		jsonError(w, err.Error(), 502)
 		return
 	}
 	defer resp.Body.Close()
@@ -682,10 +856,15 @@ func handleFeed(w http.ResponseWriter, r *http.Request) {
 	currentFresh := feedFreshIdx
 	feedMu.Unlock()
 
-	apiUrl := fmt.Sprintf("https://api.bilibili.com/x/web-interface/index/top/feed/rcmd?ps=8&fresh_type=3&fresh_idx=%d", currentFresh)
+	params := url.Values{}
+	params.Set("ps", "8")
+	params.Set("fresh_type", "3")
+	params.Set("fresh_idx", strconv.Itoa(currentFresh))
+	signedQuery := signWbiQuery(params)
+	apiUrl := "https://api.bilibili.com/x/web-interface/wbi/index/top/feed/rcmd?" + signedQuery
 	req, err := http.NewRequest("GET", apiUrl, nil)
 	if err != nil {
-		http.Error(w, err.Error(), 500)
+		jsonError(w, err.Error(), 500)
 		return
 	}
 	req.Header.Set("User-Agent", UserAgent)
@@ -702,7 +881,7 @@ func handleFeed(w http.ResponseWriter, r *http.Request) {
 		if serveCachedFeed(w) {
 			return
 		}
-		http.Error(w, err.Error(), 502)
+		jsonError(w, err.Error(), 502)
 		return
 	}
 	defer resp.Body.Close()
@@ -727,7 +906,7 @@ func handleFeed(w http.ResponseWriter, r *http.Request) {
 		if serveCachedFeed(w) {
 			return
 		}
-		http.Error(w, err.Error(), 500)
+		jsonError(w, err.Error(), 500)
 		return
 	}
 
@@ -749,7 +928,7 @@ func handleFeed(w http.ResponseWriter, r *http.Request) {
 		if serveCachedFeed(w) {
 			return
 		}
-		http.Error(w, "empty feed", 502)
+		jsonError(w, "empty feed", 502)
 		return
 	}
 	// 封面异步缓存：首屏不能等 8 张封面下载完，否则前端 8s 超时会直接报错。
@@ -839,6 +1018,7 @@ func startCPULogger() {
 			if !playbackActive() {
 				prev = map[string][2]int64{}
 				lastT = time.Time{}
+				time.Sleep(10 * time.Second)
 				continue
 			}
 			pid := findMiniappPID()
@@ -986,11 +1166,14 @@ func handleTrending(w http.ResponseWriter, r *http.Request) {
 func handleSearch(w http.ResponseWriter, r *http.Request) {
 	kw := r.URL.Query().Get("keyword")
 	if kw == "" {
-		http.Error(w, "missing keyword", 400)
+		jsonError(w, "missing keyword", 400)
 		return
 	}
 
-	searchUrl := fmt.Sprintf("https://api.bilibili.com/x/web-interface/search/all/v2?keyword=%s", url.QueryEscape(kw))
+	params := url.Values{}
+	params.Set("keyword", kw)
+	signedQuery := signWbiQuery(params)
+	searchUrl := "https://api.bilibili.com/x/web-interface/wbi/search/all/v2?" + signedQuery
 	req, _ := http.NewRequest("GET", searchUrl, nil)
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Referer", BiliReferer)
@@ -1002,7 +1185,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 	client := &http.Client{Timeout: 6 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		http.Error(w, err.Error(), 502)
+		jsonError(w, err.Error(), 502)
 		return
 	}
 	defer resp.Body.Close()
@@ -1347,6 +1530,7 @@ func ensureSpool(bvid string) (*spool, error) {
 	if _, _, err := resolvePlayURL(bvid); err != nil {
 		return nil, err
 	}
+	go cleanCache()
 	s := newSpool(bvid, partPath, filePath)
 	spoolMu.Lock()
 	if old, ok := spools[bvid]; ok {
@@ -1812,11 +1996,11 @@ func proxyUpstream(w http.ResponseWriter, r *http.Request, bvid string, candidat
 func handleStream(w http.ResponseWriter, r *http.Request) {
 	bvid := r.URL.Query().Get("bvid")
 	if bvid == "" {
-		http.Error(w, "missing bvid", 400)
+		jsonError(w, "missing bvid", 400)
 		return
 	}
 	if !validBVID(bvid) {
-		http.Error(w, "invalid bvid", 400)
+		jsonError(w, "invalid bvid", 400)
 		return
 	}
 	s, err := ensureSpool(bvid)
@@ -1833,17 +2017,17 @@ func handleStream(w http.ResponseWriter, r *http.Request) {
 func handleDetail(w http.ResponseWriter, r *http.Request) {
 	bvid := r.URL.Query().Get("bvid")
 	if bvid == "" {
-		http.Error(w, "missing bvid", 400)
+		jsonError(w, "missing bvid", 400)
 		return
 	}
 	if !validBVID(bvid) {
-		http.Error(w, "invalid bvid", 400)
+		jsonError(w, "invalid bvid", 400)
 		return
 	}
 	meta, err := resolveMeta(bvid)
 	if err != nil {
 		log.Printf("[BiliDaemon] detail failed for %s: %v", bvid, err)
-		http.Error(w, "detail: "+err.Error(), 502)
+		jsonError(w, "detail: "+err.Error(), 502)
 		return
 	}
 	picLocal := cacheCover(bvid, meta.pic)
@@ -1878,11 +2062,11 @@ func handleDetail(w http.ResponseWriter, r *http.Request) {
 func handleAudio(w http.ResponseWriter, r *http.Request) {
 	bvid := r.URL.Query().Get("bvid")
 	if bvid == "" {
-		http.Error(w, "missing bvid", 400)
+		jsonError(w, "missing bvid", 400)
 		return
 	}
 	if !validBVID(bvid) {
-		http.Error(w, "invalid bvid", 400)
+		jsonError(w, "invalid bvid", 400)
 		return
 	}
 	au, err := resolveAudio(bvid)
@@ -2035,8 +2219,41 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// cleanCache 在启动时清理过期与超量缓存，避免长期占满 /userdisk。
+
+func cleanCovers() {
+	entries, err := os.ReadDir(CoverDir)
+	if err != nil {
+		return
+	}
+	type cacheFile struct {
+		path string
+		mod  time.Time
+	}
+	var files []cacheFile
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".jpg") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		files = append(files, cacheFile{filepath.Join(CoverDir, e.Name()), info.ModTime()})
+	}
+	const MaxCovers = 120
+	if len(files) > MaxCovers {
+		sort.Slice(files, func(i, j int) bool { return files[i].mod.Before(files[j].mod) })
+		excess := len(files) - MaxCovers
+		for i := 0; i < excess; i++ {
+			_ = os.Remove(files[i].path)
+		}
+		log.Printf("[BiliDaemon] cleaned %d old covers, %d kept", excess, MaxCovers)
+	}
+}
+
+// cleanCache 清理过期与超量缓存及封面，避免长期占满 /userdisk。
 func cleanCache() {
+	cleanCovers()
 	entries, err := os.ReadDir(CacheDir)
 	if err != nil {
 		return
@@ -2096,11 +2313,11 @@ func handlePlay(w http.ResponseWriter, r *http.Request) {
 		mode = "video"
 	}
 	if bvid == "" {
-		http.Error(w, "missing bvid", 400)
+		jsonError(w, "missing bvid", 400)
 		return
 	}
 	if !validBVID(bvid) {
-		http.Error(w, "invalid bvid", 400)
+		jsonError(w, "invalid bvid", 400)
 		return
 	}
 
@@ -2184,10 +2401,10 @@ const (
 	SYS_shmget = 307
 )
 
-var shmMemPtr uintptr
+var shmMemPtr unsafe.Pointer
 
 func initVolumeSharedMemory() {
-	if shmMemPtr != 0 {
+	if shmMemPtr != nil {
 		return
 	}
 	// ARM EABI: SYS_shmget = 307, SYS_shmat = 305
@@ -2201,9 +2418,10 @@ func initVolumeSharedMemory() {
 		log.Printf("[BiliDaemon] shmat failed (raddr=0x%x, err=%v)", raddr, err)
 		return
 	}
-	shmMemPtr = raddr
+	ptrVal := raddr
+	shmMemPtr = *(*unsafe.Pointer)(unsafe.Pointer(&ptrVal))
 	shmOK = true
-	log.Printf("[BiliDaemon] volume shared memory attached at 0x%x", shmMemPtr)
+	log.Printf("[BiliDaemon] volume shared memory attached at %p", shmMemPtr)
 }
 
 var volumeControlOK = false
@@ -2232,7 +2450,11 @@ func volumeSyncLoop() {
 	if !volumeControlOK {
 		log.Printf("[BiliDaemon] no writable master volume control, rely on HAL vctl (read-only)")
 	}
-	ticker := time.NewTicker(100 * time.Millisecond)
+	interval := 100 * time.Millisecond
+	if !volumeControlOK {
+		interval = 2 * time.Second
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
 		vol, ok := readSystemVolume()
@@ -2257,12 +2479,12 @@ func volumeSyncLoop() {
 }
 
 func readSystemVolume() (int, bool) {
-	if shmMemPtr == 0 {
+	if shmMemPtr == nil {
 		if !shmOK && time.Now().Before(shmNextTry) {
 			return 0, false
 		}
 		initVolumeSharedMemory()
-		if shmMemPtr == 0 {
+		if shmMemPtr == nil {
 			if shmAttempts < 6 {
 				shmAttempts++
 			}
@@ -2272,7 +2494,7 @@ func readSystemVolume() (int, bool) {
 		}
 		shmOK = true
 	}
-	spkVol := *(*uint32)(unsafe.Pointer(shmMemPtr + 4))
+	spkVol := *(*uint32)(unsafe.Add(shmMemPtr, 4))
 	if spkVol > 100 {
 		spkVol = 50
 	}

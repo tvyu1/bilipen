@@ -2,7 +2,7 @@
 
 网易有道词典笔 A7（型号 `Y09`）上的哔哩哔哩轻应用：Falcon 运行时（Vue2 + QuickJS）前端 + Go 守护进程 + 自研 native 视频解码模块。
 
-**当前版本：v2.4.1** · 版本说明见 [CHANGELOG.md](CHANGELOG.md)
+**当前版本：v2.4.2** · 版本说明见 [CHANGELOG.md](CHANGELOG.md)
 
 ## 功能现状
 
@@ -26,15 +26,16 @@
 - [ ] _（低优先级）_ 音频停止后约 1 秒尾音（厂商 `YAudioModule` 的 ALSA 缓冲残留）
 - [ ] _（低优先级）_ 音频偶发爆音 / 失真
 
-> 已完成：观看历史、播放进度条、暂停/播放、音画同步、播放中保持亮屏、画面偏蓝修复、**原生输入法搜索**（v2.4.1）。
+> 已完成：观看历史、播放进度条、暂停/播放、音画同步、播放中保持亮屏、画面偏蓝修复、**原生输入法搜索、WBI 动态签名与待机省电加固**（v2.4.2）。
 
 ## 项目结构
 
 | 路径 | 说明 |
 |---|---|
 | `README.md` | 本说明（功能、结构、安装、使用、构建、限制、TODO） |
-| `CHANGELOG.md` | 版本说明（当前仅保留最新版本 v2.4.1） |
-| `build_bili.py` | 打包脚本：编译 Go daemon → 复制 `libs/arm/*.so` → 生成 `bili_pkg/app.js` → 重算 manifest 证书 → 输出 `.amr` |
+| `CHANGELOG.md` | 版本说明（当前保留最新版本 v2.4.2） |
+| `frontend/app.js` | 前端 Vue2 + QuickJS 源码（由 build_bili.py 读取并打包） |
+| `build_bili.py` | 打包脚本：编译 Go daemon → 复制 `libs/arm/*.so` → 装配 `frontend/app.js` → 重算 manifest 证书 → 输出 `.amr` |
 | `bili_src/main.go` | Go 守护进程（`bili-daemon`）：B 站接口、搜索/推荐/详情、扫码登录、观看历史、音频 remux、预取缓存、流代理；仅监听 `127.0.0.1:18080` |
 | `bili_src/go.mod`、`go.sum` | Go 模块依赖（仅 `skip2/go-qrcode`） |
 | `native/rgavideo.c` | native 视频解码模块源码：FFmpeg 软解 + `sws_scale` 转 BGRA + 3 帧环形缓冲 + PTS 节奏/追帧 + 暂停/恢复 + 音视频同步接口，注册为 QuickJS 模块 `rgavideo` |

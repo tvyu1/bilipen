@@ -57,6 +57,7 @@ typedef struct {
     double skip_until;         /* 跳帧目标内容时间（秒） */
     volatile int primed;       /* 首帧已解码进 back buffer */
     double last_t0_reset;      /* 追帧自愈：最近一次重置 t0 的时刻 */
+    double last_io_time;       /* 最近一次 I/O 活跃时刻（用于超时中断） */
 
     int src_w, src_h;
     double duration;
@@ -70,6 +71,18 @@ static double now_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static int decode_interrupt_cb(void *opaque) {
+    RgaPlayer *p = (RgaPlayer *)opaque;
+    if (!p) return 0;
+    if (p->stop_flag) return 1;
+    if (p->last_io_time > 0.0) {
+        if (now_sec() - p->last_io_time > 8.0) {
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void set_err(RgaPlayer *p, const char *fmt, int code) {
@@ -102,7 +115,14 @@ static void *decode_main(void *arg) {
     int ret;
 
     avformat_network_init();
+    fmt = avformat_alloc_context();
+    if (fmt) {
+        fmt->interrupt_callback.callback = decode_interrupt_cb;
+        fmt->interrupt_callback.opaque = p;
+    }
+    p->last_io_time = now_sec();
     ret = avformat_open_input(&fmt, p->url, NULL, NULL);
+    p->last_io_time = now_sec();
     if (ret < 0) {
         set_err(p, "open_input=%d", ret);
         goto done;
@@ -136,7 +156,9 @@ static void *decode_main(void *arg) {
         p->src_w = dec->width;
         p->src_h = dec->height;
     }
+    pthread_mutex_lock(&p->mu);
     p->duration = fmt->duration > 0 ? (double)fmt->duration / AV_TIME_BASE : 0.0;
+    pthread_mutex_unlock(&p->mu);
 
     pkt = av_packet_alloc();
     frm = av_frame_alloc();
@@ -160,7 +182,9 @@ static void *decode_main(void *arg) {
             if (p->stop_flag) {
                 break;
             }
+            p->last_io_time = now_sec();
             ret = av_read_frame(fmt, pkt);
+            p->last_io_time = now_sec();
             if (ret < 0) {
                 break;
             }
@@ -229,7 +253,9 @@ static void *decode_main(void *arg) {
                 }
                 if (p->skip_until > 0.0) {
                     if (pts < p->skip_until - 1e-6) {
+                        pthread_mutex_lock(&p->mu);
                         p->position = pts;
+                        pthread_mutex_unlock(&p->mu);
                         av_frame_unref(frm);
                         continue;
                     }
@@ -247,7 +273,9 @@ static void *decode_main(void *arg) {
                             t0 = now - pts;
                             p->last_t0_reset = now;
                         }
+                        pthread_mutex_lock(&p->mu);
                         p->position = pts;
+                        pthread_mutex_unlock(&p->mu);
                         av_frame_unref(frm);
                         continue;
                     }
@@ -337,6 +365,10 @@ static JSValue js_setBuffer(JSContext *ctx, JSValueConst this_val, int argc, JSV
         return JS_ThrowTypeError(ctx, "buffer too small: %d x %d > %d", w, h, (int)size);
     }
     pthread_mutex_lock(&g.mu);
+    if (g.thread_started) {
+        pthread_mutex_unlock(&g.mu);
+        return JS_ThrowTypeError(ctx, "cannot setBuffer while running");
+    }
     g.jsbuf = ptr;
     g.jsbuf_size = size;
     g.out_w = w;
@@ -468,12 +500,22 @@ static JSValue js_adjust(JSContext *ctx, JSValueConst this_val, int argc, JSValu
 
 static JSValue js_info(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
     JSValue obj = JS_NewObject(ctx);
-    JS_SetPropertyStr(ctx, obj, "width", JS_NewInt32(ctx, g.src_w));
-    JS_SetPropertyStr(ctx, obj, "height", JS_NewInt32(ctx, g.src_h));
-    JS_SetPropertyStr(ctx, obj, "duration", JS_NewFloat64(ctx, g.duration));
-    JS_SetPropertyStr(ctx, obj, "position", JS_NewFloat64(ctx, g.position));
-    JS_SetPropertyStr(ctx, obj, "finished", JS_NewInt32(ctx, g.finished));
-    JS_SetPropertyStr(ctx, obj, "primed", JS_NewInt32(ctx, g.primed));
+    int w, h, fin, primed;
+    double dur, pos;
+    pthread_mutex_lock(&g.mu);
+    w = g.src_w;
+    h = g.src_h;
+    dur = g.duration;
+    pos = g.position;
+    fin = g.finished;
+    primed = g.primed;
+    pthread_mutex_unlock(&g.mu);
+    JS_SetPropertyStr(ctx, obj, "width", JS_NewInt32(ctx, w));
+    JS_SetPropertyStr(ctx, obj, "height", JS_NewInt32(ctx, h));
+    JS_SetPropertyStr(ctx, obj, "duration", JS_NewFloat64(ctx, dur));
+    JS_SetPropertyStr(ctx, obj, "position", JS_NewFloat64(ctx, pos));
+    JS_SetPropertyStr(ctx, obj, "finished", JS_NewInt32(ctx, fin));
+    JS_SetPropertyStr(ctx, obj, "primed", JS_NewInt32(ctx, primed));
     return obj;
 }
 
@@ -482,11 +524,19 @@ static JSValue js_error(JSContext *ctx, JSValueConst this_val, int argc, JSValue
 }
 
 static JSValue js_duration(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return JS_NewFloat64(ctx, g.duration);
+    double dur;
+    pthread_mutex_lock(&g.mu);
+    dur = g.duration;
+    pthread_mutex_unlock(&g.mu);
+    return JS_NewFloat64(ctx, dur);
 }
 
 static JSValue js_position(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv) {
-    return JS_NewFloat64(ctx, g.position);
+    double pos;
+    pthread_mutex_lock(&g.mu);
+    pos = g.position;
+    pthread_mutex_unlock(&g.mu);
+    return JS_NewFloat64(ctx, pos);
 }
 
 static int js_module_init(JSContext *ctx, JSModuleDef *m) {
@@ -519,4 +569,8 @@ static JSModuleDef *rgav_loader(JSContext *ctx, const char *name) {
 __attribute__((visibility("default"))) void custom_init_jsapis(void) {
     pthread_mutex_init(&g.mu, NULL);
     registerCModuleLoader("rgavideo", rgav_loader);
+}
+
+__attribute__((visibility("default"))) int jsapi_check_unload(void) {
+    return g.thread_started ? 0 : 1;
 }
