@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
 	"sync/atomic"
@@ -575,7 +574,7 @@ func handleLocalAudioRemux(w http.ResponseWriter, r *http.Request, bvid, localPa
 		"-flush_packets", "1",
 		"-f", "mp4", "pipe:1",
 	}
-	cmd := exec.CommandContext(ctx, FFmpegPath, args...)
+	cmd := execFFmpegCommand(ctx, args)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
@@ -602,22 +601,50 @@ func handleLocalAudioRemux(w http.ResponseWriter, r *http.Request, bvid, localPa
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	buf := make([]byte, 32*1024)
+
+	type pipeChunk struct {
+		data []byte
+		err  error
+	}
+	chunkCh := make(chan pipeChunk, 16)
+	go func() {
+		defer close(chunkCh)
+		buf := make([]byte, 16*1024)
+		for {
+			n, rerr := stdout.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				select {
+				case chunkCh <- pipeChunk{data: data}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if rerr != nil {
+				select {
+				case chunkCh <- pipeChunk{err: rerr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+		}
+	}()
+
 	written := int64(0)
-	for {
-		n, rerr := stdout.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
+	for chunk := range chunkCh {
+		if len(chunk.data) > 0 {
+			if _, werr := w.Write(chunk.data); werr != nil {
 				log.Printf("[BiliDaemon] local audio remux client gone %s after %d bytes", bvid, written)
 				return
 			}
-			written += int64(n)
-			atomic.AddInt64(&audioBytes, int64(n))
+			written += int64(len(chunk.data))
+			atomic.AddInt64(&audioBytes, int64(len(chunk.data)))
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
 		}
-		if rerr != nil {
+		if chunk.err != nil {
 			break
 		}
 	}

@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version     = "2.4.4"
+	Version     = "2.4.5"
 
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
@@ -532,6 +532,12 @@ func updateActivity() {
 }
 
 func isScreenOn() bool {
+	if b, err := os.ReadFile("/sys/class/backlight/backlight/brightness"); err == nil {
+		val := strings.TrimSpace(string(b))
+		if val != "" && val != "0" {
+			return true
+		}
+	}
 	data, err := os.ReadFile("/tmp/.screen_state")
 	if err == nil && strings.Contains(string(data), "screen_on=1") {
 		return true
@@ -596,6 +602,7 @@ func main() {
 	mux.HandleFunc("/api/status", handleStatus)
 	mux.HandleFunc("/api/detail", handleDetail)
 	mux.HandleFunc("/api/audio", handleAudio)
+	mux.HandleFunc("/api/alsa/ready", handleALSAReady)
 	mux.HandleFunc("/api/metrics", handleMetrics)
 	mux.HandleFunc("/api/history", handleHistoryList)
 	mux.HandleFunc("/api/history/add", handleHistoryAdd)
@@ -2195,6 +2202,65 @@ func handleAudio(w http.ResponseWriter, r *http.Request) {
 	proxyUpstream(w, r, "audio:"+bvid, candidates, "audio/mp4", AudioIdleTimeout, &audioBytes)
 }
 
+func execFFmpegCommand(ctx context.Context, args []string) *exec.Cmd {
+	if _, err := os.Stat("/usr/bin/chrt"); err == nil {
+		chrtArgs := append([]string{"-f", "49", FFmpegPath}, args...)
+		return exec.CommandContext(ctx, "/usr/bin/chrt", chrtArgs...)
+	}
+	return exec.CommandContext(ctx, FFmpegPath, args...)
+}
+
+func handleALSAReady(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	timeoutMs := 600
+	if t := r.URL.Query().Get("timeout"); t != "" {
+		if v, err := strconv.Atoi(t); err == nil && v > 0 {
+			if v > 3000 {
+				v = 3000
+			}
+			timeoutMs = v
+		}
+	}
+
+	start := time.Now()
+	deadline := start.Add(time.Duration(timeoutMs) * time.Millisecond)
+	devicePath := "/dev/snd/pcmC0D0p"
+
+	for {
+		f, err := os.OpenFile(devicePath, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_ = f.Close()
+			time.Sleep(30 * time.Millisecond)
+			waited := time.Since(start).Milliseconds()
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":      0,
+				"ready":     true,
+				"waited_ms": waited,
+			})
+			return
+		}
+		if os.IsNotExist(err) {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":  0,
+				"ready": true,
+				"mock":  true,
+			})
+			return
+		}
+		if time.Now().After(deadline) {
+			waited := time.Since(start).Milliseconds()
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"code":      0,
+				"ready":     false,
+				"waited_ms": waited,
+				"error":     err.Error(),
+			})
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func handleAudioRemux(w http.ResponseWriter, r *http.Request, bvid string, au audioEntry) {
 	if _, err := os.Stat(FFmpegPath); err != nil {
 		http.Error(w, "ffmpeg not available", 503)
@@ -2226,7 +2292,7 @@ func handleAudioRemux(w http.ResponseWriter, r *http.Request, bvid string, au au
 		"-flush_packets", "1",
 		"-f", "mp4", "pipe:1",
 	)
-	cmd := exec.CommandContext(ctx, FFmpegPath, args...)
+	cmd := execFFmpegCommand(ctx, args)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	stdout, err := cmd.StdoutPipe()
@@ -2253,27 +2319,55 @@ func handleAudioRemux(w http.ResponseWriter, r *http.Request, bvid string, au au
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
-	buf := make([]byte, 32*1024)
+
+	type pipeChunk struct {
+		data []byte
+		err  error
+	}
+	chunkCh := make(chan pipeChunk, 16)
+	go func() {
+		defer close(chunkCh)
+		buf := make([]byte, 16*1024)
+		for {
+			n, rerr := stdout.Read(buf)
+			if n > 0 {
+				data := make([]byte, n)
+				copy(data, buf[:n])
+				select {
+				case chunkCh <- pipeChunk{data: data}:
+				case <-ctx.Done():
+					return
+				}
+			}
+			if rerr != nil {
+				select {
+				case chunkCh <- pipeChunk{err: rerr}:
+				case <-ctx.Done():
+				}
+				return
+			}
+		}
+	}()
+
 	written := int64(0)
 	loggedFirst := false
-	for {
-		n, rerr := stdout.Read(buf)
-		if n > 0 {
+	for chunk := range chunkCh {
+		if len(chunk.data) > 0 {
 			if !loggedFirst {
 				loggedFirst = true
 				log.Printf("[BiliDaemon] audio remux first byte %s", bvid)
 			}
-			if _, werr := w.Write(buf[:n]); werr != nil {
+			if _, werr := w.Write(chunk.data); werr != nil {
 				log.Printf("[BiliDaemon] audio remux client gone %s after %d bytes", bvid, written)
 				return
 			}
-			written += int64(n)
-			atomic.AddInt64(&audioBytes, int64(n))
+			written += int64(len(chunk.data))
+			atomic.AddInt64(&audioBytes, int64(len(chunk.data)))
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
 		}
-		if rerr != nil {
+		if chunk.err != nil {
 			break
 		}
 	}
