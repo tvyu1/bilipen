@@ -171,13 +171,20 @@ var script = {
     this.testSoftVideo();
     this.syncDaemonState();
     this.loadNativeVideo();
+    this._startHeartbeat();
   },
   onShow() {
     console.warn('[Lifecycle] vm onShow');
+    this.ensureDaemonRunning();
+    this._startHeartbeat();
+    if (this.currentTab === 'feed' && (!this.videos || this.videos.length === 0)) {
+      this.fetchFeed();
+    }
   },
   onHide() {
     // 系统手势回到桌面时页面进入后台：必须立即停播放，否则音频会继续输出并残留到下一次播放。
     console.warn('[Lifecycle] vm onHide, stop playback');
+    this._stopHeartbeat();
     try { this.stop(); } catch (e) {}
   },
   onUnload() {
@@ -187,6 +194,64 @@ var script = {
     try { this._unbindTextEditFinished(); } catch (e) {}
   },
   methods: {
+    requestWithRetry(opts, retries) {
+      if (retries === undefined || retries === null) retries = 1;
+      return new Promise((resolve, reject) => {
+        const doReq = (attempt) => {
+          http.request(opts).then(resolve).catch((err) => {
+            console.warn('[Http] request failed: ' + (opts.url || '') + ', attempt=' + attempt + ', err=' + err);
+            const url = opts.url || '';
+            const isDaemonUrl = url.indexOf('127.0.0.1:18080') >= 0;
+            if (isDaemonUrl && attempt === 0) {
+              this.ensureDaemonRunning();
+            }
+            if (attempt < retries) {
+              const delay = isDaemonUrl ? 800 : 500;
+              this.$page.setTimeout(() => {
+                doReq(attempt + 1);
+              }, delay);
+            } else {
+              reject(err);
+            }
+          });
+        };
+        doReq(0);
+      });
+    },
+    ensureDaemonRunning() {
+      const now = Date.now();
+      if (this._lastDaemonEnsureAt && now - this._lastDaemonEnsureAt < 3000) {
+        return;
+      }
+      this._lastDaemonEnsureAt = now;
+      console.warn('[Daemon] check ping...');
+      http.request({ url: 'http://127.0.0.1:18080/api/ping', method: 'GET', timeout: 800 })
+        .then((res) => {
+          const v = safeJson(res.body, {});
+          if (v && v.version) {
+            this.appVersion = v.version;
+          }
+        })
+        .catch(() => {
+          console.warn('[Daemon] ping failed, waking daemon up!');
+          this.bootstrapDaemon();
+        });
+    },
+    _startHeartbeat() {
+      this._stopHeartbeat();
+      this._heartbeatTimer = this.$page.setInterval(() => {
+        http.request({ url: 'http://127.0.0.1:18080/api/ping', method: 'GET', timeout: 1200 })
+          .catch(() => {
+            this.ensureDaemonRunning();
+          });
+      }, 45000);
+    },
+    _stopHeartbeat() {
+      if (this._heartbeatTimer) {
+        this.$page.clearInterval(this._heartbeatTimer);
+        this._heartbeatTimer = null;
+      }
+    },
     async loadNativeVideo() {
       try {
         const mod = await import('rgavideo');
@@ -360,7 +425,7 @@ var script = {
       this.statusText = attempt > 0 ? ('等待后端就绪(' + attempt + ')...') : '拉取新推荐...';
       let ok = false;
       try {
-        const res = await http.request({
+        const res = await this.requestWithRetry({
           url: 'http://127.0.0.1:18080/api/feed',
           method: 'GET',
           timeout: 12000
@@ -392,10 +457,10 @@ var script = {
       this.loadingSearch = true;
       this.statusText = '搜索: ' + kw + '...';
       try {
-        const res = await http.request({
+        const res = await this.requestWithRetry({
           url: 'http://127.0.0.1:18080/api/search?keyword=' + encodeURIComponent(kw),
           method: 'GET',
-          timeout: 8000
+          timeout: 10000
         });
         const data = safeJson(res.body, []);
         const list = Array.isArray(data) ? data : [];
@@ -695,10 +760,10 @@ var script = {
     },
     async fetchDownloads() {
       try {
-        const res = await http.request({
+        const res = await this.requestWithRetry({
           url: 'http://127.0.0.1:18080/api/download/list',
           method: 'GET',
-          timeout: 4000
+          timeout: 6000
         });
         const data = safeJson(res.body, {});
         if (data && data.items) {
@@ -719,10 +784,10 @@ var script = {
     async checkDetailDownload(bvid) {
       if (!bvid) return;
       try {
-        const res = await http.request({
+        const res = await this.requestWithRetry({
           url: 'http://127.0.0.1:18080/api/download/status?bvid=' + bvid,
           method: 'GET',
-          timeout: 3000
+          timeout: 4000
         });
         const data = safeJson(res.body, {});
         if (data && data.status) {
@@ -764,10 +829,10 @@ var script = {
       this.showToast('已加入离线下载队列');
       this.detailDownload = { status: 'downloading', progress: 0, text: '⏳ 启动中...' };
       try {
-        const res = await http.request({
+        const res = await this.requestWithRetry({
           url: 'http://127.0.0.1:18080/api/download/start?bvid=' + item.bvid,
           method: 'GET',
-          timeout: 6000
+          timeout: 8000
         });
         const data = safeJson(res.body, {});
         if (data && data.status) {
@@ -835,10 +900,10 @@ var script = {
       this.statusText = '加载视频详情...';
       console.warn('[Detail] open ' + item.bvid);
       try {
-        const res = await http.request({
+        const res = await this.requestWithRetry({
           url: 'http://127.0.0.1:18080/api/detail?bvid=' + item.bvid,
           method: 'GET',
-          timeout: 6000
+          timeout: 10000
         });
         const data = safeJson(res.body, null);
         if (!data || !data.title || data.error) throw new Error((data && data.error) || 'empty detail response');

@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"strings"
 )
 
 const (
@@ -78,6 +79,14 @@ func loadDownloads() {
 		if it.FilePath == "" {
 			it.FilePath = filepath.Join(DownloadDir, it.BVID+".mp4")
 		}
+		if it.PicLocal == "" || strings.HasPrefix(it.PicLocal, "/") {
+			it.PicLocal = "covers/" + it.BVID + ".jpg"
+		}
+		targetCover := filepath.Join(CoverDir, it.BVID+".jpg")
+		backupCover := filepath.Join(DownloadCoverDir, it.BVID+".jpg")
+		if !fileExists(targetCover) && fileExists(backupCover) {
+			_ = copyOrLinkFile(backupCover, targetCover)
+		}
 		if it.Status == "completed" {
 			if fi, err := os.Stat(it.FilePath); err != nil || fi.Size() == 0 {
 				it.Status = "error"
@@ -119,10 +128,12 @@ func cacheDownloadCover(bvid, picURL string) string {
 	if picURL == "" {
 		return ""
 	}
-	dst := filepath.Join(DownloadCoverDir, bvid+".jpg")
+	dst := filepath.Join(CoverDir, bvid+".jpg")
 	if fileExists(dst) {
-		return dst
+		return "covers/" + bvid + ".jpg"
 	}
+	_ = os.MkdirAll(CoverDir, 0755)
+	_ = os.MkdirAll(DownloadCoverDir, 0755)
 	req, err := http.NewRequest("GET", picURL, nil)
 	if err != nil {
 		return ""
@@ -145,7 +156,8 @@ func cacheDownloadCover(bvid, picURL string) string {
 	_ = f.Close()
 	if copyErr == nil {
 		_ = os.Rename(tmp, dst)
-		return dst
+		_ = copyOrLinkFile(dst, filepath.Join(DownloadCoverDir, bvid+".jpg"))
+		return "covers/" + bvid + ".jpg"
 	}
 	_ = os.Remove(tmp)
 	return ""

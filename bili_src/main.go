@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version     = "2.4.3"
+	Version     = "2.4.4"
 
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
@@ -273,7 +273,10 @@ func signWbiQuery(params url.Values) string {
 	wbiKeyMu.RUnlock()
 
 	if mixin == "" || time.Now().After(expires) {
-		mixin = "ea1db137cde3a7e728246b3ebd12cbd0"
+		go fetchWbiKeys()
+		if mixin == "" {
+			mixin = "ea1db137cde3a7e728246b3ebd12cbd0"
+		}
 	}
 
 	params.Set("wts", strconv.FormatInt(time.Now().Unix(), 10))
@@ -528,6 +531,14 @@ func updateActivity() {
 	atomic.StoreInt64(&lastActivityAtomic, time.Now().Unix())
 }
 
+func isScreenOn() bool {
+	data, err := os.ReadFile("/tmp/.screen_state")
+	if err == nil && strings.Contains(string(data), "screen_on=1") {
+		return true
+	}
+	return false
+}
+
 func idleWatchdog(server *http.Server) {
 	updateActivity()
 	ticker := time.NewTicker(30 * time.Second)
@@ -537,10 +548,14 @@ func idleWatchdog(server *http.Server) {
 			updateActivity()
 			continue
 		}
+		if isScreenOn() {
+			updateActivity()
+			continue
+		}
 		last := atomic.LoadInt64(&lastActivityAtomic)
 		idleDuration := time.Since(time.Unix(last, 0))
-		if idleDuration > 5*time.Minute {
-			log.Printf("[BiliDaemon] idle for %v without requests and not playing. Exiting to save battery...", idleDuration)
+		if idleDuration > 20*time.Minute {
+			log.Printf("[BiliDaemon] idle for %v without requests and screen off. Exiting to save battery...", idleDuration)
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			_ = server.Shutdown(ctx)
 			cancel()
@@ -857,6 +872,55 @@ func handleLogout(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "logged_out"})
 }
 
+func fetchRankingFeed() []VideoItem {
+	req, err := http.NewRequest("GET", "https://api.bilibili.com/x/web-interface/ranking/v2?rid=0&type=all", nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("Referer", BiliReferer)
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil
+	}
+	defer resp.Body.Close()
+	var rankData struct {
+		Code int `json:"code"`
+		Data struct {
+			List []struct {
+				Bvid     string `json:"bvid"`
+				Title    string `json:"title"`
+				Pic      string `json:"pic"`
+				Duration int    `json:"duration"`
+				Owner    struct {
+					Name string `json:"name"`
+				} `json:"owner"`
+			} `json:"list"`
+		} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&rankData); err != nil {
+		return nil
+	}
+	var items []VideoItem
+	for _, it := range rankData.Data.List {
+		if it.Bvid == "" || it.Title == "" {
+			continue
+		}
+		items = append(items, VideoItem{
+			Bvid:     it.Bvid,
+			Title:    cleanTitle(it.Title),
+			Pic:      it.Pic,
+			Owner:    it.Owner.Name,
+			Duration: it.Duration,
+		})
+		if len(items) >= 8 {
+			break
+		}
+	}
+	return items
+}
+
 func handleFeed(w http.ResponseWriter, r *http.Request) {
 	feedMu.Lock()
 	feedFreshIdx++
@@ -932,10 +996,14 @@ func handleFeed(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(items) == 0 {
+		log.Printf("[BiliDaemon] feed WBI returned 0 items, trying ranking fallback...")
+		items = fetchRankingFeed()
+	}
+	if len(items) == 0 {
 		if serveCachedFeed(w) {
 			return
 		}
-		jsonError(w, "empty feed", 502)
+		jsonError(w, "feed unavailable", 502)
 		return
 	}
 	// 封面异步缓存：首屏不能等 8 张封面下载完，否则前端 8s 超时会直接报错。
@@ -2063,7 +2131,13 @@ func handleDetail(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "detail: "+err.Error(), 502)
 		return
 	}
-	picLocal := cacheCover(bvid, meta.pic)
+	picLocal := ""
+	coverPath := filepath.Join(CoverDir, bvid+".jpg")
+	if fi, err := os.Stat(coverPath); err == nil && fi.Size() > 512 {
+		picLocal = "covers/" + bvid + ".jpg"
+	} else {
+		go cacheCover(bvid, meta.pic)
+	}
 	go func() {
 		if _, perr := ensureSpool(bvid); perr != nil {
 			log.Printf("[BiliDaemon] prefetch %s skipped: %v", bvid, perr)
