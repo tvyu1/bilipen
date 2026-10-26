@@ -68,7 +68,7 @@ print("[Build] app.js copied from frontend/app.js (%d bytes)" % os.path.getsize(
 # 4. Manifest template
 manifest = {
     "appName": "笔上哔哩",
-    "version": "2.4.6",
+    "version": "2.4.7",
     "appid": "9002000869905604",
     "icon": "app_icon.png",
     "quickjs": {

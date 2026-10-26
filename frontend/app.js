@@ -992,6 +992,9 @@ var script = {
       this._maxGap = 0;
       this._audioRetry = 0;
       this._lastNativeRead = 0;
+      this._emptyTicks = 0;
+      this._lastPosCbTime = 0;
+      this._posCbCount = 0;
       this._syncDone = false;
       this._lastPos = 0;
       this._audioPos = 0;
@@ -1066,29 +1069,37 @@ var script = {
         // 渲染上限 30fps（与 B 站 30fps 视频流一致）。低于内容帧率会让视频内容时间持续落后，
         // 表现为音频越来越超前；native 侧另有「落后 80ms 丢帧追帧」兜底。
         if (now - (this._lastNativeRead || 0) < 33) return;
-        this._lastNativeRead = now;
         this._infoAt = this._infoAt || 0;
         const t0 = now;
         const got = this.rgav.readFrame();
         if (got) {
+          this._emptyTicks = 0;
+          this._lastNativeRead = now;
           ctx.putImageData(this.imageData, 0, 0);
           this._drawMs += (Date.now() - t0);
           this._frames++;
-          const now = Date.now();
+          const nowPerf = Date.now();
           if (this._lastCb) {
-            const gap = now - this._lastCb;
+            const gap = nowPerf - this._lastCb;
             if (gap > (this._maxGap || 0)) this._maxGap = gap;
           }
-          this._lastCb = now;
-          if (now - this._perfAt >= 2000) {
-            const sec = (now - this._perfAt) / 1000;
+          this._lastCb = nowPerf;
+          if (nowPerf - this._perfAt >= 2000) {
+            const sec = (nowPerf - this._perfAt) / 1000;
             const fps = Math.round(this._frames / sec);
             const avg = this._frames > 0 ? Math.round(this._drawMs / this._frames) : 0;
             console.warn('[Perf] native draws/s=' + fps + ' avg=' + avg + 'ms maxgap=' + (this._maxGap || 0) + ' pos=' + (this._lastPos || 0).toFixed(1) + ' apos=' + (this._audioPos || 0).toFixed(1) + ' out=' + this.playSize.w + 'x' + this.playSize.h);
             this._frames = 0;
             this._drawMs = 0;
             this._maxGap = 0;
-            this._perfAt = now;
+            this._perfAt = nowPerf;
+          }
+        } else {
+          // 未取到帧：不打断下一 16ms tick 轮询，但连续 3 次空帧（约 48ms）退避 33ms 避免 CPU 空转抢占
+          this._emptyTicks = (this._emptyTicks || 0) + 1;
+          if (this._emptyTicks >= 3) {
+            this._lastNativeRead = now;
+            this._emptyTicks = 0;
           }
         }
         // 每帧只取 position 数值（不创建 JS 对象）；info() 降到 ~0.8s 一次，
@@ -1113,8 +1124,9 @@ var script = {
               const D = (Date.now() - (this._resumeAt || this._latePrimeAt)) / 1000;
               if (D > 0.2) {
                 try {
-                  this.rgav.adjust(D);
-                  console.warn('[Sync] late-prime adjust D=' + D.toFixed(2));
+                  const safeD = Math.min(D, 0.5);
+                  this.rgav.adjust(safeD);
+                  console.warn('[Sync] late-prime adjust D=' + safeD.toFixed(2));
                 } catch (e) {}
               }
             }
@@ -1158,32 +1170,39 @@ var script = {
                   if (this._driftEwma === 0 || this._driftEwma === undefined) {
                     this._driftEwma = rawDrift;
                   } else {
-                    this._driftEwma = this._driftEwma * 0.65 + rawDrift * 0.35;
+                    this._driftEwma = this._driftEwma * 0.70 + rawDrift * 0.30;
                   }
                   this._syncSampleCount = (this._syncSampleCount || 0) + 1;
 
                   // 至少累积 3 次采样（约 1.5s）后再做决策，防止起播偶发瞬态误调
                   if (this._syncSampleCount >= 3) {
-                    const absDrift = Math.abs(this._driftEwma);
-                    // 40ms 死区过滤（人类视听感知极限约为 ±45ms，死区内完全不干预，保持画面丝滑）
-                    if (absDrift > 0.045) {
-                      const elapsedSinceAdjust = now - (this._lastAdjustAt || 0);
-                      // 冷却时间限制（>= 1500ms），避免过于频繁校准
-                      if (elapsedSinceAdjust >= 1500) {
-                        let delta = this._driftEwma;
-                        // 步长截断：单次最大校正 ±0.35s，避免大跳变
-                        if (delta > 0.35) delta = 0.35;
-                        if (delta < -0.35) delta = -0.35;
-
+                    const elapsedSinceAdjust = now - (this._lastAdjustAt || 0);
+                    // 冷却时间延长至 3000ms，避免频发微调
+                    if (elapsedSinceAdjust >= 3000) {
+                      if (this._driftEwma > 0.120) {
+                        // 视频滞后音频 > 120ms: 温和跳帧追赶，单次最大仅 50ms（消除激进大步长）
+                        const delta = Math.min(this._driftEwma, 0.050);
                         try {
                           this.rgav.adjust(delta);
-                          console.warn('[Sync] dynamic adjust: drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
+                          console.warn('[Sync] dynamic adjust (catch-up): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
                           this._lastAdjustAt = now;
-                          this._driftEwma = 0; // 重置滤波累计
+                          this._driftEwma = 0;
+                        } catch (e) {
+                          console.warn('[Sync] adjust error: ' + e);
+                        }
+                      } else if (this._driftEwma < -0.300) {
+                        // 仅在极端严重超前时微量刹车，最大 -25ms，杜绝 nanosleep 150ms 冻结
+                        const delta = -0.025;
+                        try {
+                          this.rgav.adjust(delta);
+                          console.warn('[Sync] dynamic adjust (lead-brake): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
+                          this._lastAdjustAt = now;
+                          this._driftEwma = 0;
                         } catch (e) {
                           console.warn('[Sync] adjust error: ' + e);
                         }
                       }
+                      // 注：-0.300s ~ +0.120s 范围内完全不调用 adjust()，保持画面极致流畅！
                     }
                   }
                 }
@@ -1276,8 +1295,20 @@ var script = {
           });
           bind('onPosition', (p) => {
             // vendor 播放器回调音频播放位置：用它做动态音画对齐。
+            const nowPerf = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
             let a = Number(p) || 0;
             const vpos = this._lastPos || 0;
+
+            // P1 统计插桩：记录回调时间间隔、原始值、是否严格递增与整数性
+            if (this._lastPosCbTime) {
+              const dt = nowPerf - this._lastPosCbTime;
+              this._posCbCount = (this._posCbCount || 0) + 1;
+              if (this._posCbCount % 3 === 0) {
+                console.warn('[PosStats] cb#' + this._posCbCount + ' dt=' + dt.toFixed(1) + 'ms raw=' + p + ' val=' + a.toFixed(3) + ' isInt=' + (a === Math.floor(a)));
+              }
+            }
+            this._lastPosCbTime = nowPerf;
+
             if (!this._audioUnit && a > 0) {
               // 自动识别单位：秒 or 毫秒（取与视频位置更接近的换算）。
               this._audioUnit = (Math.abs(a - vpos) <= Math.abs(a / 1000 - vpos)) ? 1 : 1000;

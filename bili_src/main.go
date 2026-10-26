@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version     = "2.4.6"
+	Version     = "2.4.7"
 
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
@@ -81,11 +81,12 @@ type VideoItem struct {
 }
 
 type PlayStatus struct {
-	Playing bool   `json:"playing"`
-	Bvid    string `json:"bvid"`
-	Title   string `json:"title"`
-	Mode    string `json:"mode"`
-	Volume  int    `json:"volume"`
+	Playing  bool   `json:"playing"`
+	Bvid     string `json:"bvid"`
+	Title    string `json:"title"`
+	Mode     string `json:"mode"`
+	Volume   int    `json:"volume"`
+	HwVolume int    `json:"hw_volume"`
 }
 
 type playEntry struct {
@@ -635,6 +636,7 @@ func main() {
 	mux.HandleFunc("/api/audio", handleAudio)
 	mux.HandleFunc("/api/alsa/ready", handleALSAReady)
 	mux.HandleFunc("/api/metrics", handleMetrics)
+	mux.HandleFunc("/api/volume", handleVolume)
 	mux.HandleFunc("/api/history", handleHistoryList)
 	mux.HandleFunc("/api/history/add", handleHistoryAdd)
 	mux.HandleFunc("/api/history/clear", handleHistoryClear)
@@ -695,13 +697,41 @@ func handleStatus(w http.ResponseWriter, r *http.Request) {
 	mu.Unlock()
 
 	vol := getSystemVolume()
+	hwVol := mapSysVolToHw(vol)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(PlayStatus{
-		Playing: playing,
-		Bvid:    bvid,
-		Title:   name,
-		Mode:    mode,
-		Volume:  vol,
+		Playing:  playing,
+		Bvid:     bvid,
+		Title:    name,
+		Mode:     mode,
+		Volume:   vol,
+		HwVolume: hwVol,
+	})
+}
+
+func handleVolume(w http.ResponseWriter, r *http.Request) {
+	setVal := r.URL.Query().Get("set")
+	if setVal != "" {
+		if v, err := strconv.Atoi(setVal); err == nil {
+			if v < 0 {
+				v = 0
+			}
+			if v > 100 {
+				v = 100
+			}
+			hw := mapSysVolToHw(v)
+			runTinymix("DAC LINEOUT Volume", strconv.Itoa(hw))
+			log.Printf("[BiliDaemon] /api/volume manual set: %d%% -> DAC LINEOUT %d/30", v, hw)
+		}
+	}
+	sysVol := getSystemVolume()
+	hwVol := mapSysVolToHw(sysVol)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"system_volume": sysVol,
+		"hw_volume":     hwVol,
+		"hw_control":    "DAC LINEOUT Volume",
+		"hw_range":      "0-30",
 	})
 }
 
@@ -2690,9 +2720,26 @@ func cancelAllStreams() {
 	}
 }
 
+// mapSysVolToHw 将 0~100 系统音量线性映射至 ALSA Control 23 (DAC LINEOUT Volume, 0~30)
+func mapSysVolToHw(vol int) int {
+	if vol <= 0 {
+		return 0 // 静音
+	}
+	hw := int(float64(vol)*30.0/100.0 + 0.5)
+	if hw < 1 {
+		hw = 1
+	}
+	if hw > 30 {
+		hw = 30
+	}
+	return hw
+}
+
 func initHardwareAudio() {
-	// 锁定 LINEOUT 增益为 16，避免 >18 削波破音（平台手册 6.2）。用控件名而非编号，防止枚举顺序变化。
-	runTinymix("DAC LINEOUT Volume", "16")
+	vol := getSystemVolume()
+	hwVal := mapSysVolToHw(vol)
+	runTinymix("DAC LINEOUT Volume", strconv.Itoa(hwVal))
+	log.Printf("[BiliDaemon] init hardware audio: DAC LINEOUT Volume = %d/30 (system volume %d%%)", hwVal, vol)
 }
 
 func runTinymix(args ...string) {
@@ -2734,17 +2781,15 @@ func initVolumeSharedMemory() {
 
 var volumeControlOK = false
 
-// probeVolumeControl 探测 ALSA 上是否存在可用于系统音量联动的控件。
-// 该机型 card0 只有 DAC LINEOUT/HPMIX，没有 control 25 / Master Playback Volume，
-// 系统音量由 libydhal_audio 直接读 vctl 共享内存生效，因此这里只在控件存在时才写。
+// probeVolumeControl 探测 ALSA Control 23 (DAC LINEOUT Volume) 是否可用。
+// 该控件控制喇叭硬件放大增益（0..30），用于与系统音量实时联动。
 func probeVolumeControl() bool {
-	for _, ctl := range []string{"25", "Master Playback Volume"} {
+	for _, ctl := range []string{"DAC LINEOUT Volume", "23"} {
 		out, _ := exec.Command(TinymixPath, "-D", "0", "get", ctl).CombinedOutput()
 		text := strings.ToLower(string(out))
 		if strings.Contains(text, "invalid mixer control") || strings.Contains(text, "error") {
 			continue
 		}
-		// 能读到具体数值才算控件存在。
 		if strings.ContainsAny(text, "0123456789") {
 			return true
 		}
@@ -2752,11 +2797,13 @@ func probeVolumeControl() bool {
 	return false
 }
 
-// volumeSyncLoop 保持旧包行为：跟随系统音量写 ALSA；控件不可用时退化为只读（HAL 已处理音量）。
+// volumeSyncLoop 保持与系统音量实时联动：100ms 轮询 vctl 共享内存，变化时写入 DAC LINEOUT Volume (0..30)
 func volumeSyncLoop() {
 	volumeControlOK = probeVolumeControl()
 	if !volumeControlOK {
 		log.Printf("[BiliDaemon] no writable master volume control, rely on HAL vctl (read-only)")
+	} else {
+		log.Printf("[BiliDaemon] hardware volume control active on DAC LINEOUT Volume (0..30)")
 	}
 	interval := 100 * time.Millisecond
 	if !volumeControlOK {
@@ -2773,16 +2820,9 @@ func volumeSyncLoop() {
 		if !volumeControlOK {
 			continue
 		}
-		alsaVal := int(float64(vol) * 2.55)
-		if alsaVal > 255 {
-			alsaVal = 255
-		}
-		if alsaVal < 0 {
-			alsaVal = 0
-		}
-		alsaStr := strconv.Itoa(alsaVal)
-		runTinymix("25", alsaStr, alsaStr)
-		log.Printf("[BiliDaemon] volume sync: %d%% -> ALSA %s/255", vol, alsaStr)
+		hwVal := mapSysVolToHw(vol)
+		runTinymix("DAC LINEOUT Volume", strconv.Itoa(hwVal))
+		log.Printf("[BiliDaemon] volume sync: %d%% -> DAC LINEOUT %d/30", vol, hwVal)
 	}
 }
 
