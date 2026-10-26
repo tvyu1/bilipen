@@ -1135,40 +1135,54 @@ var script = {
             // 当视频与音频均在正常播放中时计算实时时钟偏差
             if (this._syncDone && this._audioPos > 0 && this._audioPosAt > 0 && info.position > 1.0) {
               const audioElapsed = (now - this._audioPosAt) / 1000;
-              // 仅当音频进度在正常更新周期内（<= 2.5s）进行单调时钟插值
-              if (audioElapsed < 2.5) {
+              // 追踪实际音频物理位置是否在推进，检测弱网断流卡顿
+              if (this._lastTrackedAudioPos !== this._audioPos) {
+                this._lastTrackedAudioPos = this._audioPos;
+                this._lastTrackedAudioMovedAt = now;
+              }
+              const audioElapsedSinceMove = now - (this._lastTrackedAudioMovedAt || now);
+              const audioStalled = audioElapsedSinceMove > 2000;
+
+              // 仅当音频进度在正常更新周期内且音频未卡死断流时，才进行动态微调
+              if (audioElapsed < 2.5 && !audioStalled) {
                 const audioNow = this._audioPos + audioElapsed;
                 const videoNow = info.position;
                 const rawDrift = audioNow - videoNow; // >0 视频落后需跳帧；<0 视频超前需等待
 
-                // EWMA 低通滤波平滑单核调度偶发抖动
-                if (this._driftEwma === 0 || this._driftEwma === undefined) {
-                  this._driftEwma = rawDrift;
+                // 异常硬偏差保护：若偏差超过 2s（如弱网断流或起播未对齐），重置滤波并暂停盲调，避免死循环减速
+                if (Math.abs(rawDrift) > 2.0) {
+                  this._driftEwma = 0;
+                  this._syncSampleCount = 0;
                 } else {
-                  this._driftEwma = this._driftEwma * 0.65 + rawDrift * 0.35;
-                }
-                this._syncSampleCount = (this._syncSampleCount || 0) + 1;
+                  // EWMA 低通滤波平滑单核调度偶发抖动
+                  if (this._driftEwma === 0 || this._driftEwma === undefined) {
+                    this._driftEwma = rawDrift;
+                  } else {
+                    this._driftEwma = this._driftEwma * 0.65 + rawDrift * 0.35;
+                  }
+                  this._syncSampleCount = (this._syncSampleCount || 0) + 1;
 
-                // 至少累积 3 次采样（约 1.5s）后再做决策，防止起播偶发瞬态误调
-                if (this._syncSampleCount >= 3) {
-                  const absDrift = Math.abs(this._driftEwma);
-                  // 40ms 死区过滤（人类视听感知极限约为 ±45ms，死区内完全不干预，保持画面丝滑）
-                  if (absDrift > 0.045) {
-                    const elapsedSinceAdjust = now - (this._lastAdjustAt || 0);
-                    // 冷却时间限制（>= 1500ms），避免过于频繁校准
-                    if (elapsedSinceAdjust >= 1500) {
-                      let delta = this._driftEwma;
-                      // 步长截断：单次最大校正 ±0.35s，避免大跳变
-                      if (delta > 0.35) delta = 0.35;
-                      if (delta < -0.35) delta = -0.35;
+                  // 至少累积 3 次采样（约 1.5s）后再做决策，防止起播偶发瞬态误调
+                  if (this._syncSampleCount >= 3) {
+                    const absDrift = Math.abs(this._driftEwma);
+                    // 40ms 死区过滤（人类视听感知极限约为 ±45ms，死区内完全不干预，保持画面丝滑）
+                    if (absDrift > 0.045) {
+                      const elapsedSinceAdjust = now - (this._lastAdjustAt || 0);
+                      // 冷却时间限制（>= 1500ms），避免过于频繁校准
+                      if (elapsedSinceAdjust >= 1500) {
+                        let delta = this._driftEwma;
+                        // 步长截断：单次最大校正 ±0.35s，避免大跳变
+                        if (delta > 0.35) delta = 0.35;
+                        if (delta < -0.35) delta = -0.35;
 
-                      try {
-                        this.rgav.adjust(delta);
-                        console.warn('[Sync] dynamic adjust: drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
-                        this._lastAdjustAt = now;
-                        this._driftEwma = 0; // 重置滤波累计
-                      } catch (e) {
-                        console.warn('[Sync] adjust error: ' + e);
+                        try {
+                          this.rgav.adjust(delta);
+                          console.warn('[Sync] dynamic adjust: drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
+                          this._lastAdjustAt = now;
+                          this._driftEwma = 0; // 重置滤波累计
+                        } catch (e) {
+                          console.warn('[Sync] adjust error: ' + e);
+                        }
                       }
                     }
                   }
@@ -1368,7 +1382,19 @@ var script = {
           this._syncTimer = null;
         }
       } catch (e) {}
+      try {
+        if (this._infoResumeTimer) {
+          this.$page.clearTimeout(this._infoResumeTimer);
+          this._infoResumeTimer = null;
+        }
+      } catch (e) {}
       this._syncDone = false;
+      this._driftEwma = 0;
+      this._syncSampleCount = 0;
+      this._audioPos = 0;
+      this._audioPosAt = 0;
+      this._lastTrackedAudioPos = null;
+      this._lastTrackedAudioMovedAt = 0;
       this._stopAudioOnly();
       try {
         if (this.rgav) this.rgav.stop();
@@ -1683,6 +1709,7 @@ var script = {
     async stop() {
       if (this.isStopping) return;
       this.isStopping = true;
+      const gen = ++this.playGen;
       // 先让 daemon 取消音频/视频流：解码线程才能尽快退出，否则 stop() 会等网络读超时，声音拖尾约 1s。
       try {
         http.request({
@@ -1696,7 +1723,6 @@ var script = {
       try {
         if (this._playItem) this.recordHistory(this._playItem, this._lastPos || this.curPos || 0, this.vDuration || 0);
       } catch (e) {}
-      const gen = this.playGen || 0;
       this.statusText = '正在退出播放...';
       const player = this.vPlayer;
       if (player) {

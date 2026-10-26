@@ -557,8 +557,8 @@ func handleLocalAudioRemux(w http.ResponseWriter, r *http.Request, bvid, localPa
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	sid := registerStream(cancel)
-	defer unregisterStream(sid)
+	aid := registerAudioStream(cancel)
+	defer unregisterAudioStream(aid)
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostdin",

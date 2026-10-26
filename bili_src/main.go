@@ -30,7 +30,7 @@ import (
 )
 
 const (
-	Version     = "2.4.5"
+	Version     = "2.4.6"
 
 	Port        = 18080
 	VctlShmKey  = 0x7663746c // 'vctl' SysV shared memory
@@ -38,6 +38,7 @@ const (
 	BiliReferer = "https://www.bilibili.com/"
 	CoverDir    = "/userdisk/secondary/miniapp/data/mini_app/pkg/9002000869905604/data/covers"
 	CookieFile  = "/userdisk/bili_cookie.txt"
+	FeedCacheFile = "/userdisk/bili_feed_cache.json"
 	TinymixPath = "/usr/bin/tinymix"
 	FFmpegPath  = "/usr/bin/ffmpeg"
 	// 流式代理的空闲超时：超过该时间没有收到上游数据则主动断开，避免长视频被整体超时截断。
@@ -185,9 +186,35 @@ var (
 
 	// 封面下载并发上限，单核 A7 上避免 8~12 个 TLS 连接同时建立。
 	coverSem = make(chan struct{}, 3)
+)
 
-	// API 请求客户端（B 站 Web 接口，短请求）
-	apiClient = &http.Client{Timeout: 8 * time.Second}
+// dialIPv4Context 强制使用 tcp4 (IPv4)，彻底杜绝 RV1106 Linux 内核因缺少 IPv6 支持 (CONFIG_IPV6 未开启)
+// 而报 socket: address family not supported by protocol (EAFNOSUPPORT) 导致整个网络请求失败。
+func dialIPv4Context(ctx context.Context, network, addr string) (net.Conn, error) {
+	return (&net.Dialer{
+		Timeout:   8 * time.Second,
+		KeepAlive: 30 * time.Second,
+	}).DialContext(ctx, "tcp4", addr)
+}
+
+var (
+	// 全局通用 IPv4 Transport（用于 API、元数据与封面请求）
+	ipv4Transport = &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           dialIPv4Context,
+		ForceAttemptHTTP2:     false,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   6 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// API 请求客户端（B 站 Web 接口，短请求，强制 IPv4）
+	apiClient = &http.Client{
+		Transport: ipv4Transport,
+		Timeout:   8 * time.Second,
+	}
 )
 
 // WBI 签名算法实现（防止 B 站接口命中 -412 风控）
@@ -303,10 +330,13 @@ var (
 
 	// 媒体流客户端：不设整体 Timeout（否则长视频必然被截断），
 	// 只限制连接与响应头阶段，body 阶段用 StreamIdleTimeout 看门狗。
+	// 强制使用 tcp4，避免媒体 CDN 域名解析到 IPv6 AAAA 记录时连接失败。
 	streamClient = &http.Client{
 		Transport: &http.Transport{
-			Proxy:                 nil,
-			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			Proxy: nil,
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				return (&net.Dialer{Timeout: 6 * time.Second, KeepAlive: 30 * time.Second}).DialContext(ctx, "tcp4", addr)
+			},
 			MaxIdleConns:          8,
 			MaxIdleConnsPerHost:   4,
 			IdleConnTimeout:       60 * time.Second,
@@ -583,6 +613,7 @@ func main() {
 	_ = os.MkdirAll(CoverDir, 0755)
 	loadHistory()
 	loadDownloads()
+	initFeedCache()
 	log.Printf("[BiliDaemon] Starting v%s on 127.0.0.1:%d ...", Version, Port)
 
 	go cleanCache()
@@ -886,8 +917,7 @@ func fetchRankingFeed() []VideoItem {
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Referer", BiliReferer)
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		return nil
 	}
@@ -952,60 +982,54 @@ func handleFeed(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Cookie", cookie)
 	}
 
-	client := &http.Client{Timeout: 8 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("[BiliDaemon] feed upstream error: %v", err)
-		if serveCachedFeed(w) {
-			return
+	var items []VideoItem
+	resp, err := apiClient.Do(req)
+	if err == nil && resp.StatusCode == http.StatusOK {
+		var raw struct {
+			Code int `json:"code"`
+			Data struct {
+				Item []struct {
+					Bvid     string `json:"bvid"`
+					Title    string `json:"title"`
+					Pic      string `json:"pic"`
+					Duration int    `json:"duration"`
+					Owner    struct {
+						Name string `json:"name"`
+					} `json:"owner"`
+				} `json:"item"`
+			} `json:"data"`
 		}
-		jsonError(w, err.Error(), 502)
-		return
-	}
-	defer resp.Body.Close()
-
-	var raw struct {
-		Code int `json:"code"`
-		Data struct {
-			Item []struct {
-				Bvid     string `json:"bvid"`
-				Title    string `json:"title"`
-				Pic      string `json:"pic"`
-				Duration int    `json:"duration"`
-				Owner    struct {
-					Name string `json:"name"`
-				} `json:"owner"`
-			} `json:"item"`
-		} `json:"data"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
-		log.Printf("[BiliDaemon] feed decode error: %v", err)
-		if serveCachedFeed(w) {
-			return
+		if derr := json.NewDecoder(resp.Body).Decode(&raw); derr == nil && raw.Code == 0 {
+			for _, it := range raw.Data.Item {
+				if it.Bvid == "" || it.Title == "" {
+					continue
+				}
+				items = append(items, VideoItem{
+					Bvid:     it.Bvid,
+					Title:    cleanTitle(it.Title),
+					Pic:      it.Pic,
+					Owner:    it.Owner.Name,
+					Duration: it.Duration,
+				})
+			}
+		} else {
+			log.Printf("[BiliDaemon] feed WBI decode error: %v", derr)
 		}
-		jsonError(w, err.Error(), 500)
-		return
-	}
-
-	items := make([]VideoItem, 0, len(raw.Data.Item))
-	for _, it := range raw.Data.Item {
-		if it.Bvid == "" || it.Title == "" {
-			continue
+		resp.Body.Close()
+	} else {
+		if resp != nil {
+			resp.Body.Close()
 		}
-		items = append(items, VideoItem{
-			Bvid:     it.Bvid,
-			Title:    cleanTitle(it.Title),
-			Pic:      it.Pic,
-			Owner:    it.Owner.Name,
-			Duration: it.Duration,
-		})
+		log.Printf("[BiliDaemon] feed WBI upstream error: %v", err)
 	}
 
+	// 降级 Tier 1: 榜单/热门推荐（轻量静态接口，不依赖 WBI）
 	if len(items) == 0 {
-		log.Printf("[BiliDaemon] feed WBI returned 0 items, trying ranking fallback...")
+		log.Printf("[BiliDaemon] feed WBI unavailable, fallback to ranking...")
 		items = fetchRankingFeed()
 	}
+
+	// 降级 Tier 2: 本地磁盘/内存持久化缓存（弱网/断网保底）
 	if len(items) == 0 {
 		if serveCachedFeed(w) {
 			return
@@ -1013,6 +1037,7 @@ func handleFeed(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "feed unavailable", 502)
 		return
 	}
+
 	// 封面异步缓存：首屏不能等 8 张封面下载完，否则前端 8s 超时会直接报错。
 	go cacheCoversAsync(items)
 	feedCacheSet(items)
@@ -1179,11 +1204,39 @@ func cacheCoversAsync(items []VideoItem) {
 	wg.Wait()
 }
 
-// serveCachedFeed 在上游抖动时返回上一次成功的推荐列表，避免首页空白。
+// initFeedCache 在守护进程启动时从磁盘恢复推荐流缓存，实现弱网/断网下的秒开与断网保底。
+func initFeedCache() {
+	data, err := os.ReadFile(FeedCacheFile)
+	if err != nil || len(data) == 0 {
+		return
+	}
+	var items []VideoItem
+	if err := json.Unmarshal(data, &items); err == nil && len(items) > 0 {
+		lastFeedMu.Lock()
+		lastFeed = items
+		lastFeedMu.Unlock()
+		log.Printf("[BiliDaemon] feed: restored %d items from disk cache", len(items))
+	}
+}
+
+// serveCachedFeed 在上游抖动或断网时返回推荐列表，避免首页空白。
+// 先读内存缓存；若内存为空（如冷启动/守护进程重启），则自动加载磁盘持久化缓存。
 func serveCachedFeed(w http.ResponseWriter) bool {
 	lastFeedMu.Lock()
 	items := lastFeed
 	lastFeedMu.Unlock()
+	if len(items) == 0 {
+		data, err := os.ReadFile(FeedCacheFile)
+		if err == nil && len(data) > 0 {
+			var diskItems []VideoItem
+			if err := json.Unmarshal(data, &diskItems); err == nil && len(diskItems) > 0 {
+				lastFeedMu.Lock()
+				lastFeed = diskItems
+				lastFeedMu.Unlock()
+				items = diskItems
+			}
+		}
+	}
 	if len(items) == 0 {
 		return false
 	}
@@ -1194,17 +1247,30 @@ func serveCachedFeed(w http.ResponseWriter) bool {
 }
 
 func feedCacheSet(items []VideoItem) {
+	if len(items) == 0 {
+		return
+	}
 	lastFeedMu.Lock()
 	lastFeed = items
 	lastFeedMu.Unlock()
+
+	go func(list []VideoItem) {
+		data, err := json.Marshal(list)
+		if err != nil {
+			return
+		}
+		tmp := FeedCacheFile + ".tmp"
+		if err := os.WriteFile(tmp, data, 0644); err == nil {
+			_ = os.Rename(tmp, FeedCacheFile)
+		}
+	}(items)
 }
 
 func handleTrending(w http.ResponseWriter, r *http.Request) {
 	req, _ := http.NewRequest("GET", "https://api.bilibili.com/x/web-interface/search/square?limit=8", nil)
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Referer", BiliReferer)
-	client := &http.Client{Timeout: 4 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode([]string{"科技", "原神", "动画", "音乐", "游戏", "美食"})
@@ -1264,8 +1330,7 @@ func handleSearch(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("Cookie", cookie)
 	}
 
-	client := &http.Client{Timeout: 6 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := apiClient.Do(req)
 	if err != nil {
 		jsonError(w, err.Error(), 502)
 		return
@@ -2268,8 +2333,8 @@ func handleAudioRemux(w http.ResponseWriter, r *http.Request, bvid string, au au
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	sid := registerStream(cancel)
-	defer unregisterStream(sid)
+	aid := registerAudioStream(cancel)
+	defer unregisterAudioStream(aid)
 
 	args := []string{
 		"-hide_banner", "-loglevel", "error", "-nostdin",
@@ -2553,11 +2618,48 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	currentMode = ""
 	mu.Unlock()
 
-	// 注意：这里不再强制取消媒体流。厂商 softvideo 播放器在流被服务端提前断开时
-	// 停止过程会触发其内部状态机异常（真机表现为连续操作后崩溃），稳定性优先。
+	// 立即取消所有活跃的音频重封装 FFmpeg 进程与流，
+	// 避免在弱网断网时 FFmpeg 子进程因阻塞在上游网络读而卡死达 45s，
+	// 导致用户退出应用后再打开时 CPU 被占满、ALSA/端口冲突无法使用。
+	cancelActiveAudio()
+
 	log.Printf("[BiliDaemon] playback session stop")
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{"status": "stopped"})
+}
+
+var (
+	audioStreamMu sync.Mutex
+	audioCancels  = map[int]context.CancelFunc{}
+	audioNextID   int
+)
+
+func registerAudioStream(cancel context.CancelFunc) int {
+	audioStreamMu.Lock()
+	audioNextID++
+	id := audioNextID
+	audioCancels[id] = cancel
+	audioStreamMu.Unlock()
+	return id
+}
+
+func unregisterAudioStream(id int) {
+	audioStreamMu.Lock()
+	delete(audioCancels, id)
+	audioStreamMu.Unlock()
+}
+
+func cancelActiveAudio() {
+	audioStreamMu.Lock()
+	n := len(audioCancels)
+	for id, cancel := range audioCancels {
+		cancel()
+		delete(audioCancels, id)
+	}
+	audioStreamMu.Unlock()
+	if n > 0 {
+		log.Printf("[BiliDaemon] cancelled %d active audio remux streams", n)
+	}
 }
 
 func registerStream(cancel context.CancelFunc) int {
