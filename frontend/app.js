@@ -1166,22 +1166,24 @@ var script = {
                   this._driftEwma = 0;
                   this._syncSampleCount = 0;
                 } else {
-                  // EWMA 低通滤波平滑单核调度偶发抖动
+                  // EWMA 低通滤波平滑单核调度偶发抖动 (0.75 惯性 + 0.25 采样，有效滤除 60ms 锯齿波)
                   if (this._driftEwma === 0 || this._driftEwma === undefined) {
                     this._driftEwma = rawDrift;
                   } else {
-                    this._driftEwma = this._driftEwma * 0.70 + rawDrift * 0.30;
+                    this._driftEwma = this._driftEwma * 0.75 + rawDrift * 0.25;
                   }
                   this._syncSampleCount = (this._syncSampleCount || 0) + 1;
 
                   // 至少累积 3 次采样（约 1.5s）后再做决策，防止起播偶发瞬态误调
                   if (this._syncSampleCount >= 3) {
                     const elapsedSinceAdjust = now - (this._lastAdjustAt || 0);
-                    // 冷却时间延长至 3000ms，避免频发微调
+                    // 冷却时间延长至 3000ms（约 3 个 onPosition 周期）
                     if (elapsedSinceAdjust >= 3000) {
-                      if (this._driftEwma > 0.120) {
-                        // 视频滞后音频 > 120ms: 温和跳帧追赶，单次最大仅 50ms（消除激进大步长）
-                        const delta = Math.min(this._driftEwma, 0.050);
+                      // P1 实测定参：死区 = P95(60ms) * 1.5 = 90ms (0.090s)
+                      if (this._driftEwma > 0.090) {
+                        // 视频滞后音频 > 90ms: 温和追赶，比例调节 min(max(ewma*0.5, 30ms), 50ms)
+                        // 与 native 300ms 环形缓冲溢出丢帧串联互补：90ms~300ms 由控制器主动拉回，杜绝无干预空档
+                        const delta = Math.min(Math.max(this._driftEwma * 0.5, 0.030), 0.050);
                         try {
                           this.rgav.adjust(delta);
                           console.warn('[Sync] dynamic adjust (catch-up): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
@@ -1190,9 +1192,10 @@ var script = {
                         } catch (e) {
                           console.warn('[Sync] adjust error: ' + e);
                         }
-                      } else if (this._driftEwma < -0.300) {
-                        // 仅在极端严重超前时微量刹车，最大 -25ms，杜绝 nanosleep 150ms 冻结
-                        const delta = -0.025;
+                      } else if (this._driftEwma < -0.180) {
+                        // 视频超前音频 > 180ms（超出人类视听感知极限 +185ms 时微量刹车）
+                        // 步长严格限制为 -0.020s (20ms)，绝不产生 150ms 的肉眼可见定格
+                        const delta = -0.020;
                         try {
                           this.rgav.adjust(delta);
                           console.warn('[Sync] dynamic adjust (lead-brake): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
@@ -1202,7 +1205,7 @@ var script = {
                           console.warn('[Sync] adjust error: ' + e);
                         }
                       }
-                      // 注：-0.300s ~ +0.120s 范围内完全不调用 adjust()，保持画面极致流畅！
+                      // 注：-0.180s ~ +0.090s 属于感知与采样死区，完全不调用 adjust()，保持画面极致流畅！
                     }
                   }
                 }
@@ -1324,13 +1327,13 @@ var script = {
             }
           });
           bind('onInfo', () => {
-            // 兜底保护：若 1800ms 内未收到 onPosition，通过 onInfo 兜底放行避免挂起
+            // 兜底保护：若 2800ms 内未收到 onPosition，通过 onInfo 兜底放行避免挂起
             if (this._infoResumeTimer) this.$page.clearTimeout(this._infoResumeTimer);
             this._infoResumeTimer = this.$page.setTimeout(() => {
               if (!this._syncDone) {
                 this._syncResume(gen, 'audio-info-fallback', 0.5);
               }
-            }, 1800);
+            }, 2800);
           });
           ap.start('http://127.0.0.1:18080/api/audio?bvid=' + item.bvid + '&variant=remux');
           console.warn('[Rga] audio started, pause=' + (typeof ap.pause));
