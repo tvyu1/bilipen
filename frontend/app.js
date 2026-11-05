@@ -245,23 +245,7 @@ var script = {
   },
   onUnload() {
     console.warn('[Lifecycle] vm onUnload, stop playback');
-    // stop() 开头有 isStopping 早退，而该标志只在 300ms 定时器里复位；
-    // 页面卸载时定时器可能不再执行 → 标志卡死 → 后续 stop() 全部空转，
-    // rgav 解码线程因此永远不退出（jsapi_check_unload 一直返回 0）。
-    try { this.isStopping = false; } catch (e) {}
-    try {
-      if (this.rgav && typeof this.rgav.stop === 'function') this.rgav.stop();
-    } catch (e) { console.warn('[Rga] unload stop error: ' + e); }
     try { this.stop(); } catch (e) {}
-    // 释放厂商模块引用：只要还有 JS 侧引用，jsapi_check_unload 就一直返回 0，
-    // 运行时会每 2s 重试卸载（实测重试 1400+ 次），并让下次进入播放页变慢/卡死。
-    try { this.rgav = null; } catch (e) {}
-    try { this.vPlayer = null; } catch (e) {}
-    try { this.audioPlayer = null; } catch (e) {}
-    try { this._audioBind = []; } catch (e) {}
-    try { this._audioBuffer = null; } catch (e) {}
-    try { this._audioImageData = null; } catch (e) {}
-    try { this.imageData = null; } catch (e) {}
     try { this._cancelTextEdit(); } catch (e) {}
     try { this._unbindTextEditFinished(); } catch (e) {}
   },
@@ -1477,15 +1461,9 @@ var script = {
       // 那是设备内存/CPU 的压力源（日志里的 "BitmapFactory: image is too too large" 即此）。
       // 本地缩略图（covers/xxx.jpg）直接返回。
       if (!u) return '';
-      // 协议相对地址（//i0.hdslb.com/...）先补 https，否则运行时下载器会失败。
-      if (u.indexOf('//') === 0) u = 'https:' + u;
       if (u.indexOf('http') !== 0) return u;
-      if (u.indexOf('@') < 0) u = u + '@320w_180h.jpg';
-      // 远程封面统一走 daemon 代理：B 站图床要 Referer，且 http 会 301 到 https，
-      // 设备上的 jquick_network_download_url_to_file 不补 Referer、也不跟跳转，
-      // 直连会稳定失败（实测 115 次 ERROR，封面空白）。
-      if (u.indexOf('127.0.0.1:18080') >= 0) return u;
-      return 'http://127.0.0.1:18080/api/proxy/cover?url=' + encodeURIComponent(u);
+      if (u.indexOf('@') >= 0) return u;
+      return u + '@320w_180h.jpg';
     },
     detailSrc() {
       const d = this.detail || {};
@@ -2991,13 +2969,6 @@ var script = {
         }).catch(() => {});
       } catch (e) {}
       this._stopNative();
-      // 关键：native 解码线程由 rgav 持有。以前这里只停 vPlayer/音频、漏了 rgav，
-      // 于是离开播放页后线程一直活着 → jsapi_check_unload 永远返回 0 → 厂商运行时
-      // 每 2s 重试卸载模块（实测重试 1400+ 次）；再次进播放页时 js_start 又要 join
-      // 旧线程（最多 8s），表现就是「进播放就点不动」。
-      if (this.rgav && typeof this.rgav.stop === 'function') {
-        try { this.rgav.stop(); } catch (e) { console.warn('[Rga] stop error: ' + e); }
-      }
       // 更新观看历史：记录本次播放停止时的进度与时长。
       try {
         if (this._playItem) this.recordHistory(this._playItem, this._lastPos || this.curPos || 0, this.vDuration || 0);
@@ -3067,7 +3038,27 @@ var script = {
       if (x === null || y === null) return null;
       return { x: x, y: y };
     },
-    // 进度条只做展示：点击快进已移除（设备触摸事件不稳，只保留 -10/+10 按钮跳转）。
+    // 进度条只做展示：点击跳转已移除，跳转只保留 -10/+10 两个按钮。
+    _removedHandleProgressSeek(e) {
+      if (!this.isPlaying || !this.vDuration || this.vDuration <= 0) return;
+      if (this.playerState === 'loading' || this.playerState === 'seeking' || this.playerState === 'error') return;
+      // 与 ctrl-bar 固定布局一致：4(padding)+30+2+24+2 = 62；轨道宽 150。
+      const PROG_X = 62;
+      const PROG_W = 150;
+      let pct = -1;
+      if (e && typeof e.offsetX === 'number' && e.offsetX >= 0 && e.offsetX <= PROG_W + 4) {
+        pct = e.offsetX / PROG_W;
+      } else {
+        const p = this.readTouchPoint(e);
+        if (p && typeof p.x === 'number') pct = (p.x - PROG_X) / PROG_W;
+      }
+      if (pct < 0) return;
+      if (pct > 1) pct = 1;
+      const targetSec = Math.max(0, Math.round(pct * this.vDuration));
+      console.warn('[Seek] progress tap: pct=' + pct.toFixed(3) + ' targetSec=' + targetSec + ' / ' + this.vDuration);
+      this.seekTo(targetSec);
+    },
+
     seekTo(targetSec) {
       if (this.isStopping || !this.isPlaying) return;
       const item = this._playItem || this.detailItem();
@@ -4923,10 +4914,10 @@ var render = function () {
                 _c('div', { staticClass: ["pl-bar-sweep"], style: { width: '34%', marginLeft: _vm.sweepPct + '%' } })
               ]),
             (_vm.playerState === 'error') ? _c('div', { staticClass: ["pl-err-btns"] }, [
-              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { if ($event && typeof $event.stopPropagation === 'function') $event.stopPropagation(); _vm.retryNow(); } } }, [
+              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { $event.stopPropagation(); _vm.retryNow(); } } }, [
                 _c('text', { staticClass: ["pl-err-btn-text"] }, [_vm._v("重试")])
               ]),
-              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { if ($event && typeof $event.stopPropagation === 'function') $event.stopPropagation(); _vm.stop(); } } }, [
+              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { $event.stopPropagation(); _vm.stop(); } } }, [
                 _c('text', { staticClass: ["pl-err-btn-text"] }, [_vm._v("返回")])
               ])
             ]) : _vm._e()
@@ -4942,14 +4933,14 @@ var render = function () {
             _c('text', { staticClass: ["pl-pill-text"] }, [_vm._v("缓冲 " + (_vm.streamPct >= 0 ? (_vm.streamPct + '%') : ''))])
           ]) : _vm._e()
       ]),
-      (!_vm.audioMode && (_vm.ctrlVisible || _vm.isPaused)) ? _c('div', { staticClass: ["ctrl-bar"], on: { "click": function ($event) { if ($event && typeof $event.stopPropagation === 'function') $event.stopPropagation(); _vm._showCtrlBar(); } } }, [
+      (!_vm.audioMode && (_vm.ctrlVisible || _vm.isPaused)) ? _c('div', { staticClass: ["ctrl-bar"], on: { "click": function ($event) { $event.stopPropagation(); _vm._showCtrlBar(); } } }, [
         _c('div', { staticClass: ["ctrl-btn"], on: { "click": _vm.togglePause } }, [
           _c('text', { staticClass: ["ctrl-btn-text"] }, [_vm._v(_vm.isPaused ? "▶" : "❚❚")])
         ]),
         _c('div', { staticClass: ["ctrl-btn", "ctrl-btn-sm"], on: { "click": function () { _vm.seekRelative(-10); } } }, [
           _c('text', { staticClass: ["ctrl-btn-text"] }, [_vm._v("-10")])
         ]),
-        // 进度条只做展示：点击快进已移除（设备触摸事件不稳，容易误触发连续 seek）。
+        // 进度条只做展示（点击快进已移除，跳转只保留 -10/+10）
         _c('div', {
           staticClass: ["ctrl-track"]
         }, [

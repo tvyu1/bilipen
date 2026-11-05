@@ -1479,6 +1479,15 @@ func handleDetail(w http.ResponseWriter, r *http.Request) {
 	// 旧实现会对每个被点开的详情页把整段视频落盘到 /userdisk/bili_cache，
 	// 用户只是浏览也会产生数十 MB 的 eMMC 写与单核抢占（v2.4.7 审计 D-01）。
 	// 预取改由"真正开始播放"时经 handleStream → ensureSpool 触发。
+	//
+	// 但可以预热两个「纯 JSON」接口：playurl 与音轨解析都只是 API 往返、不落盘，
+	// 实测起播首帧前会多付 0.5~1.5s。这里后台跑，失败静默（弱网下不影响页面）。
+	go func(id string) {
+		if _, _, err := resolvePlayURL(id); err != nil {
+			return
+		}
+		_, _ = resolveAudio(id)
+	}(bvid)
 
 	// 三连状态（未登录返回 null，前端据此把按钮置灰）
 	var relation interface{}

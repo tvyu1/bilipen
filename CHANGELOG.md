@@ -1,5 +1,26 @@
 # CHANGELOG
 
+## v3.0.7（2026-11-06）
+
+> 回滚版：v3.0.3~v3.0.6 引入「进播放页完全无响应」，v3.0.2 正常。本版把**前端整体回到 v3.0.2**，只保留一处需求变更；并把最可疑的音频转码回退。
+
+### 回退
+- `frontend/app.js` 全量回退到 `0c2f385`（v3.0.2）版本，撤销 v3.0.3~v3.0.6 的前端改动：进度条 click 守卫、`thumbUrl` 走代理、`stop()` 补 `rgav.stop()`、`onUnload` 强制复位 `isStopping` 与引用释放。
+- `bili_src/audio.go` 的音轨 remux 由 `-c:a aac -ar 48000 -ac 2 -b:a 96k` **回退为 `-c:a copy`**：真机日志显示播放器只收了 1377 字节就断开，且时间上与「进播放页无响应」重合，先回退再单独验证。
+
+### 保留的需求变更
+- 进度条点击快进已移除（`ctrl-track` 不再挂 click，`_handleProgressSeek`/`onProgressClick` 删除），跳转只保留 −10 / +10。
+
+### 保留的 Go 侧修复（与播放页无响应无关）
+- 看门狗阈值 20s/15s + 读写双向判活、孤儿 ffmpeg pidfile 回收、DASH 错误归因、Cookie 原子写失败清理、封面下载限流与 `MaxConnsPerHost`、`RLIMIT_NOFILE` 抬高、WBI 失败退避、打开详情页时后台预热 playurl/音轨（只发 JSON，不落盘）。
+
+### 产物
+| 项 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,811,684 B | `5c6c55e5a9dd61f46cf94350746c3693` |
+| 包内 `libs/arm/bili-daemon` | 6,422,663 B | `107cd132c980c84513b02af380106f21` |
+| 包内 `app.js` | 206,720 B | `87f420bab80e31c1526f8cc1649e8c44` |
+
 ## v3.0.6（2026-11-06）
 
 ### 修复：页面卸载时 `stop()` 被 `isStopping` 早退，解码线程仍不退出

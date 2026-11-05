@@ -179,11 +179,9 @@ func handleAudioRemux(w http.ResponseWriter, r *http.Request, bvid string, au au
 		"-i", au.url,
 		"-f", "lavfi", "-i", "color=c=black:s=160x90:r=1",
 		"-map", "0:a:0", "-map", "1:v:0",
-		// 设备 ALSA 只接受 48kHz/2ch/S16_LE：ffmpeg 侧反复报 "play file format wrong,
-		// only support channels is 2, rate is 48000"，随后 writePcm 失败、音频位置冻结
-		// 且不自愈（实测 1857 / 117 / 11 次）。B 站音轨多为 44.1kHz，`-c:a copy` 会原样送进
-		// 厂商播放器，所以这里统一转 48k/2ch。代价是多一路 AAC 解码+编码（单核 A7，待实测）。
-		"-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "96k",
+		// 曾尝试转码 48k/2ch 去对齐设备 ALSA，但真机日志显示音频播放器只收到 1377 字节就断开
+		// （vendor 侧直接丢弃该流），并伴随进播放页无响应；v3.0.7 起回退为原样 copy。
+		"-c:a", "copy",
 		"-c:v", "mpeg4", "-q:v", "31", "-g", "1",
 		"-shortest",
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
@@ -301,11 +299,9 @@ func handleLocalAudioRemux(w http.ResponseWriter, r *http.Request, bvid, localPa
 		"-i", localPath,
 		"-f", "lavfi", "-i", "color=c=black:s=160x90:r=1",
 		"-map", "0:a:0", "-map", "1:v:0",
-		// 设备 ALSA 只接受 48kHz/2ch/S16_LE：ffmpeg 侧反复报 "play file format wrong,
-		// only support channels is 2, rate is 48000"，随后 writePcm 失败、音频位置冻结
-		// 且不自愈（实测 1857 / 117 / 11 次）。B 站音轨多为 44.1kHz，`-c:a copy` 会原样送进
-		// 厂商播放器，所以这里统一转 48k/2ch。代价是多一路 AAC 解码+编码（单核 A7，待实测）。
-		"-c:a", "aac", "-ar", "48000", "-ac", "2", "-b:a", "96k",
+		// 曾尝试转码 48k/2ch 去对齐设备 ALSA，但真机日志显示音频播放器只收到 1377 字节就断开
+		// （vendor 侧直接丢弃该流），并伴随进播放页无响应；v3.0.7 起回退为原样 copy。
+		"-c:a", "copy",
 		"-c:v", "mpeg4", "-q:v", "31", "-g", "1",
 		"-shortest",
 		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
