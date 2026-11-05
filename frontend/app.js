@@ -1461,9 +1461,15 @@ var script = {
       // 那是设备内存/CPU 的压力源（日志里的 "BitmapFactory: image is too too large" 即此）。
       // 本地缩略图（covers/xxx.jpg）直接返回。
       if (!u) return '';
+      // 协议相对地址（//i0.hdslb.com/...）先补 https，否则运行时下载器会失败。
+      if (u.indexOf('//') === 0) u = 'https:' + u;
       if (u.indexOf('http') !== 0) return u;
-      if (u.indexOf('@') >= 0) return u;
-      return u + '@320w_180h.jpg';
+      if (u.indexOf('@') < 0) u = u + '@320w_180h.jpg';
+      // 远程封面统一走 daemon 代理：B 站图床要 Referer，且 http 会 301 到 https，
+      // 设备上的 jquick_network_download_url_to_file 不补 Referer、也不跟跳转，
+      // 直连会稳定失败（实测 115 次 ERROR，封面空白）。
+      if (u.indexOf('127.0.0.1:18080') >= 0) return u;
+      return 'http://127.0.0.1:18080/api/proxy/cover?url=' + encodeURIComponent(u);
     },
     detailSrc() {
       const d = this.detail || {};
@@ -4918,10 +4924,10 @@ var render = function () {
                 _c('div', { staticClass: ["pl-bar-sweep"], style: { width: '34%', marginLeft: _vm.sweepPct + '%' } })
               ]),
             (_vm.playerState === 'error') ? _c('div', { staticClass: ["pl-err-btns"] }, [
-              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { $event.stopPropagation(); _vm.retryNow(); } } }, [
+              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { if ($event && typeof $event.stopPropagation === 'function') $event.stopPropagation(); _vm.retryNow(); } } }, [
                 _c('text', { staticClass: ["pl-err-btn-text"] }, [_vm._v("重试")])
               ]),
-              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { $event.stopPropagation(); _vm.stop(); } } }, [
+              _c('div', { staticClass: ["pl-err-btn"], on: { "click": function ($event) { if ($event && typeof $event.stopPropagation === 'function') $event.stopPropagation(); _vm.stop(); } } }, [
                 _c('text', { staticClass: ["pl-err-btn-text"] }, [_vm._v("返回")])
               ])
             ]) : _vm._e()
@@ -4937,7 +4943,7 @@ var render = function () {
             _c('text', { staticClass: ["pl-pill-text"] }, [_vm._v("缓冲 " + (_vm.streamPct >= 0 ? (_vm.streamPct + '%') : ''))])
           ]) : _vm._e()
       ]),
-      (!_vm.audioMode && (_vm.ctrlVisible || _vm.isPaused)) ? _c('div', { staticClass: ["ctrl-bar"], on: { "click": function ($event) { $event.stopPropagation(); _vm._showCtrlBar(); } } }, [
+      (!_vm.audioMode && (_vm.ctrlVisible || _vm.isPaused)) ? _c('div', { staticClass: ["ctrl-bar"], on: { "click": function ($event) { if ($event && typeof $event.stopPropagation === 'function') $event.stopPropagation(); _vm._showCtrlBar(); } } }, [
         _c('div', { staticClass: ["ctrl-btn"], on: { "click": _vm.togglePause } }, [
           _c('text', { staticClass: ["ctrl-btn-text"] }, [_vm._v(_vm.isPaused ? "▶" : "❚❚")])
         ]),

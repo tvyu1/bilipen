@@ -1,5 +1,40 @@
 # CHANGELOG
 
+## v3.0.3（2026-11-06）
+
+> 日志驱动修复版：**只处理 BiliPen 自身的问题**（相机/OCR、本地数据库迁移、OTA、桌面/词典等系统组件的问题按要求忽略）。归属一律按日志里的 `console(<appid>)` 标签核对，避免把同机其它小程序的输出算到本应用头上。
+
+### 归属核对结果（先纠两个被高估的数字）
+- `play file format wrong` 共 2103 条，其中 **1857 条**归属 BiliPen（其余属桌面/词典，另 184 条无邻近标签）。
+- `jquick_network_download_url_to_file` ERROR 共 115 条，其中**约 31 条**归属 BiliPen（38 桌面 / 17 词典 / 12 播放器）。
+- `[Sync]` 252、`[Perf]` 185、`lead-brake` 173、`writePcm failed` 117、`position frozen` 11、`TypeError at click` 15：**全部归属 BiliPen**。
+
+### 修复：控制条/错误页点击抛 `TypeError: not a function`（15 次）
+- 3 处点击处理器未加守护就调 `$event.stopPropagation()`：控制条容器（点控制条任意位置都会冒泡命中）、错误页「重试」「返回」。
+- 设备侧 Falcon 合成的 click 不保证带该方法（README §11 已记录）；缺失时控制条点击抛错，错误页两个按钮更是「先抛错、后调动作」——等于重试/返回失效。
+- 改法：`typeof` 守护后再调用。验证：`node --check` 通过，真机待验。
+
+### 修复：封面直连 CDN 稳定失败（约 31 次）
+- 前端 `thumbUrl()` 把 `http://i0/i2.hdslb.com/...@320w_180h.jpg` 原样交给运行时下载器，而该下载器不补 Referer、不跟 301→https，B 站图床因此拒绝。
+- 改为：协议相对地址补 `https:`，远程封面统一走 daemon 的 `/api/proxy/cover?url=`（现成接口，会补 Referer 并跟随跳转）。
+- daemon 侧 `cacheCover()` 原来只设 UA 不设 Referer，服务端封面缓存同样会失败；补上 Referer。
+
+### 修复：音频 PCM 采样率不匹配（根因，1857 次告警的来源）
+- 设备 ALSA 只接受 **48kHz/2ch/S16_LE**，而 B 站音轨多为 **44.1kHz**，remux 又用 `-c:a copy` 原样透传 → 厂商播放器每帧被拒：`play file format wrong` 1857 次 → `audio writePcm failed` 117 次 → `audio position frozen (no auto-restart)` 11 次（最长 **125 秒**静音，且代码明确不自愈）。
+- 在线（`handleAudioRemux`）与离线（`handleLocalAudioRemux`）两处都改为 `-c:a aac -ar 48000 -ac 2 -b:a 96k`，从源头对齐设备格式。
+- 代价：单核 A7 上多一路 AAC 解码+编码，**CPU 影响待真机实测**；若不可接受，可回退为「只做用户可见恢复」。
+
+### 未修（需要单独决策，均已在 README §十 登记）
+- **音频冻结不自愈是刻意设计**：代码注释记录「自愈重开 + 紧随的 seek 会让厂商播放器短时间内换手两次，触发已知 UAF 崩溃」，改动必须先真机验证。
+- `[Sync] lead-brake` 173 次、|drift| 中位 0.515s 的稳态偏差仍在（对应 README §十「按 _acSlope 做速率匹配出帧」）。
+
+### 产物
+| 项 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,810,477 B | `e0c46dac95ef44f54db0ed62d4e58792` |
+| 包内 `libs/arm/bili-daemon` | 6,422,663 B | `f92e41d9bf7dfada4053ebf6b659632d` |
+| 包内 `app.js` | 212,794 B | `88d1947a62c4870e10cf0da8565b5244` |
+
 ## v3.0.2（2026-11-05）
 
 > 固化版：把工作区里已在真机跑过、却一直没提交的改动固化成发布基线，并修掉复核发现的三个「看起来修了、其实没生效」的问题。

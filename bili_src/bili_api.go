@@ -250,6 +250,9 @@ func cacheCover(bvid, picUrl string) string {
 		return ""
 	}
 	req.Header.Set("User-Agent", UserAgent)
+	// B 站图床对无 Referer 的请求会 403/301：缺这个头时封面缓存永远失败，
+	// 前端只能退回 CDN 直连，而设备运行时既不补 Referer 也不跟跳转（实测 115 次 ERROR）。
+	req.Header.Set("Referer", BiliReferer)
 	resp, err := apiClient.Do(req)
 	if err != nil {
 		return ""
