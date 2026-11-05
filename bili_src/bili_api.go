@@ -42,6 +42,9 @@ func newDownloadClient() *http.Client {
 			IdleConnTimeout:       30 * time.Second,
 			MaxIdleConns:          4,
 			MaxIdleConnsPerHost:   2,
+			// 显式上限：弱网下并发请求会各自开连接，不设上限时 fd 会被吃光，
+			// daemon 之后连新 socket 都建不出来（表现就是整机「无网络」）。
+			MaxConnsPerHost: 6,
 		},
 	}
 }
@@ -72,6 +75,7 @@ func newClient(timeout time.Duration) *http.Client {
 			IdleConnTimeout:       30 * time.Second,
 			MaxIdleConns:          8,
 			MaxIdleConnsPerHost:   4,
+			MaxConnsPerHost:       8,
 		},
 	}
 }
@@ -89,6 +93,7 @@ var (
 	wbiSubKey     string
 	wbiMixinKey   string
 	wbiKeysExpire time.Time
+	wbiLastFail   time.Time // 上次拉取 nav 失败的时刻：失败后 60s 内不再阻塞式重试
 	wbiMu         sync.Mutex
 )
 
@@ -126,10 +131,30 @@ func updateWbiKeysFromNav(imgURL, subURL string) {
 	log.Printf("[BiliDaemon] updated WBI mixin key")
 }
 
+// fetchWbiKeys 带失败退避：弱网下拉不到 nav 时，不能每次签名请求都阻塞 10s 重试，
+// 否则 feed / 搜索 / 详情会轮流卡满超时，现象上就是「所有接口都像没网」。
 func fetchWbiKeys() {
+	wbiMu.Lock()
+	if !wbiLastFail.IsZero() && time.Since(wbiLastFail) < time.Minute {
+		wbiMu.Unlock()
+		return
+	}
+	wbiMu.Unlock()
+	if fetchWbiKeysOnce() {
+		wbiMu.Lock()
+		wbiLastFail = time.Time{}
+		wbiMu.Unlock()
+		return
+	}
+	wbiMu.Lock()
+	wbiLastFail = time.Now()
+	wbiMu.Unlock()
+}
+
+func fetchWbiKeysOnce() bool {
 	req, err := http.NewRequest("GET", "https://api.bilibili.com/x/web-interface/nav", nil)
 	if err != nil {
-		return
+		return false
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Referer", BiliReferer)
@@ -138,7 +163,7 @@ func fetchWbiKeys() {
 	}
 	resp, err := apiClient.Do(req)
 	if err != nil {
-		return
+		return false
 	}
 	defer resp.Body.Close()
 	var d struct {
@@ -150,11 +175,13 @@ func fetchWbiKeys() {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-		return
+		return false
 	}
 	if d.Data.WbiImg.ImgUrl != "" && d.Data.WbiImg.SubUrl != "" {
 		updateWbiKeysFromNav(d.Data.WbiImg.ImgUrl, d.Data.WbiImg.SubUrl)
+		return true
 	}
+	return false
 }
 
 func signWbiQuery(params url.Values) string {
@@ -236,6 +263,26 @@ func clearCookie() {
 	_ = os.Remove(CookieFile)
 }
 
+// 封面下载限流：弱网下每个请求最长占 10s，而 cacheCoversAsync 有 11 个调用点、
+// 每次按条目无界起 goroutine。不限制时协程与 TCP fd 会持续堆积，最终 daemon
+// 连新连接都开不出来（现象：先能加载一次，之后整机像断网，重启 daemon 又能撑一次）。
+var (
+	coverSem      = make(chan struct{}, 2) // 同时在飞的封面下载上限
+	coverMu       sync.Mutex
+	coverInflight = map[string]bool{} // 同 bvid 去重，避免重复下载
+)
+
+func acquireCoverSlot(timeout time.Duration) bool {
+	select {
+	case coverSem <- struct{}{}:
+		return true
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+func releaseCoverSlot() { <-coverSem }
+
 func cacheCover(bvid, picUrl string) string {
 	if picUrl == "" {
 		return ""
@@ -245,6 +292,22 @@ func cacheCover(bvid, picUrl string) string {
 	if fi, err := os.Stat(localPath); err == nil && fi.Size() > 512 {
 		return "covers/" + localName
 	}
+	coverMu.Lock()
+	if coverInflight[bvid] {
+		coverMu.Unlock()
+		return "" // 同一封面已在下载中，交给那一趟
+	}
+	coverInflight[bvid] = true
+	coverMu.Unlock()
+	defer func() {
+		coverMu.Lock()
+		delete(coverInflight, bvid)
+		coverMu.Unlock()
+	}()
+	if !acquireCoverSlot(3 * time.Second) {
+		return "" // 排队超时：宁可这次不缓存，也不要把 fd 堆起来
+	}
+	defer releaseCoverSlot()
 	req, err := http.NewRequest("GET", picUrl, nil)
 	if err != nil {
 		return ""
@@ -668,6 +731,13 @@ func handleProxyCover(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing url", 400)
 		return
 	}
+	// 与 cacheCover 共用同一组槽位：前端一屏就有 8 张图，弱网下不限流会把
+	// daemon 的连接/fd 全部占死，后续所有接口都表现为「无网络」。
+	if !acquireCoverSlot(3 * time.Second) {
+		http.Error(w, "cover busy", http.StatusServiceUnavailable)
+		return
+	}
+	defer releaseCoverSlot()
 	if strings.HasPrefix(raw, "//") {
 		raw = "https:" + raw
 	}

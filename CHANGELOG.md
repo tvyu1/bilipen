@@ -1,5 +1,33 @@
 # CHANGELOG
 
+## v3.0.4（2026-11-06）
+
+> 弱网稳定性修复。针对「校园网里只能加载一次、之后像断网；删掉重装又能看一次；家里复现不了」的反馈，检查了 daemon 的 HTTP 连接池与封面预取，修掉三处会**累积资源直到耗尽**的结构性缺陷。
+
+### 排查结论（连接池 / 并发 / fd）
+- `apiClient` 与 `streamClient` 只设了 `MaxIdleConnsPerHost`，**没有 `MaxConnsPerHost`**；`downloadClient` 同样。弱网下每条请求各自建连，没有上限。
+- `cacheCoversAsync` 有 **11 个调用点**，每次按条目 `go func` 无界起协程，**无并发上限、无同 bvid 去重**，每条最长占 10s（`apiClient.Timeout`）。
+- daemon **从未调整 fd 上限**（继承 miniapp 的小限额）。连接一堆积就 `EMFILE`，此后连新 socket 都建不出来——这正是「一次之后整机像断网、重启 daemon 又能撑一次」的形状；家里网快、协程很快排空，所以复现不了。
+- `signWbiQuery()` 在 key 为空/过期时同步调 `fetchWbiKeys()`（10s 超时）；失败后**每个签名请求都再等 10s**，把 feed / 搜索 / 详情轮流拖死。
+
+### 修复
+1. 封面下载统一走 **2 个并发槽 + 同 bvid 去重**，排队 3s 拿不到槽就放弃本次（不再堆 fd）；`/api/proxy/cover` 纳入同一组槽位（v3.0.3 让前端改走代理后，若不限流反而会加重 daemon 负担）。
+2. 两个 Transport 补 `MaxConnsPerHost`（api/stream = 8，download = 6），超出时排队而不是无限建连。
+3. 启动时把 `RLIMIT_NOFILE` 软限制抬到硬限制并打日志。
+4. WBI key 拉取加 **60s 失败退避**，避免弱网下每个请求都阻塞 10s。
+5. `/api/metrics` 新增 `goroutines`、`open_fds`、`cover_pending`，下次现场可直接判定是否资源耗尽。
+
+### 验证状态
+- `go vet` 通过；本地两次构建 md5 一致。
+- **未在校园弱网复现**（家里复现不了）：本次是结构性修复，效果需回校后观察 `/api/metrics` 的 `open_fds` / `goroutines` 曲线。
+
+### 产物
+| 项 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,812,069 B | `efb474202fc2912ad72d9202c1115375` |
+| 包内 `libs/arm/bili-daemon` | 6,422,663 B | `ae6a3baa6d3f7a1ffff0dc1315775ba1` |
+| 包内 `app.js` | 212,794 B | `88d1947a62c4870e10cf0da8565b5244` |
+
 ## v3.0.3（2026-11-06）
 
 > 日志驱动修复版：**只处理 BiliPen 自身的问题**（相机/OCR、本地数据库迁移、OTA、桌面/词典等系统组件的问题按要求忽略）。归属一律按日志里的 `console(<appid>)` 标签核对，避免把同机其它小程序的输出算到本应用头上。
