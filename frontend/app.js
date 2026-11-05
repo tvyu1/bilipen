@@ -245,6 +245,13 @@ var script = {
   },
   onUnload() {
     console.warn('[Lifecycle] vm onUnload, stop playback');
+    // stop() 开头有 isStopping 早退，而该标志只在 300ms 定时器里复位；
+    // 页面卸载时定时器可能不再执行 → 标志卡死 → 后续 stop() 全部空转，
+    // rgav 解码线程因此永远不退出（jsapi_check_unload 一直返回 0）。
+    try { this.isStopping = false; } catch (e) {}
+    try {
+      if (this.rgav && typeof this.rgav.stop === 'function') this.rgav.stop();
+    } catch (e) { console.warn('[Rga] unload stop error: ' + e); }
     try { this.stop(); } catch (e) {}
     // 释放厂商模块引用：只要还有 JS 侧引用，jsapi_check_unload 就一直返回 0，
     // 运行时会每 2s 重试卸载（实测重试 1400+ 次），并让下次进入播放页变慢/卡死。
