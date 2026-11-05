@@ -365,8 +365,8 @@ $TC/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc -shared -fPIC -O2 \
 | `libjsapi_softvideo.so` | 188,288 / `8bde3e91…` | `libjsapi_softvideo_1638136790.so` 224,908 / `7f2ecf60…` |
 
   ⇒ 校验「设备上跑的是不是这份源码」只能用 `app.js` 与 `bili-daemon` 的哈希；改写机制未确认【未验证】
-- 上表是 v3.0.1 时的采样；v3.0.2 的 cert/槽内值见 §十三。**`.so` 的改名后缀每次安装都会变**（本次为 `_1136092709.so`，内容也被 PMS 改写），因此它不能用来判断源码版本。
-- A/B 双槽：`packages.json` 里 `"b": true` 表示当前槽，实测该应用只保留 `b/`
+- 上表是 v3.0.1 时的采样；v3.0.2 的 cert/槽内值见 §十三。**`.so` 的改名后缀每次安装都会变**（历次观测：`_1638136790`、`_1136092709`、`_1899323339`），内容也被 PMS 改写，因此它不能用来判断源码版本。
+- A/B 双槽：`packages.json` 里 `b` 字段表示当前槽。实测本应用两次安装分别落在 `a/` 与 `b/`（第二次安装后 `a/` 被删除、`b` 由 `false` 变 `true`），所以「装完还是旧代码」要先看槽位
 
 ### 7.8 路径与命令【实测】
 
@@ -617,6 +617,14 @@ adb shell "tinymix -D 0 get 'DAC LINEOUT Volume'"
 | `app.js` | 212,064 | `924ef4bbb1183081161b3e1f369fccb7` |
 
 > 部署后设备槽内 `app.js` 与 `libs/bili-daemon` 的 md5 应与上表一致；`.so` 会被 PMS 改名改写（§7.7），不能用于比对。
+
+**部署实测（2026-11-05 23:5x → 11-06 00:0x，设备 `7FC2800009702019`）**
+
+- `adb push 9002000869905604.amr /userdisk/bili.amr` 后 `miniapp_cli install /userdisk/bili.amr` 返回 `{"appid": "9002000869905604", "ret": 0}`；槽位由 `a/` 切到 `b/`。
+- **旧宿主不会热加载新代码**：必须 `kill -9 <host pid>` 重启（`killall miniapp` 无效），系统随后自动拉起宿主与 daemon。
+- 重启后 `/api/ping` = `{"version":"3.0.2",...}`；槽内 `app.js` = `924ef4bb…`、`libs/bili-daemon` = `b37487af…`、manifest `"version": "3.0.2"`，与上表一致。
+- 首页渲染正常；点开视频后 daemon 日志出现 `audio remux first byte` + `spool ... completed`，`playback cpu: total=37% load=1.55 top: miniapp=28% video_decoder=4% YAudioModule=3%`；`/userdisk/bili_alsa.pid` 未残留（启动回收没有误杀）。
+- 宿主刚重启时 `miniapp_cli start` 会打印 `Error strlen(response) <= 0 / start failed`，但进程其实已被系统拉起——以 `ps` 与 `/api/ping` 为准，不要按该返回值判失败。
 
 ---
 
