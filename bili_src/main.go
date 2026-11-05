@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -390,12 +391,20 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	spoolMu.Unlock()
 
+	openFDs := 0
+	if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
+		openFDs = len(entries)
+	}
+
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":          Version,
 		"uptime":           time.Since(startedAt).Truncate(time.Second).String(),
 		"load1":            load1,
 		"mem_available_kb": memFree,
+		"goroutines":       runtime.NumGoroutine(),
+		"open_fds":         openFDs,
+		"cover_pending":    len(coverSem),
 		"spools":           list,
 		"counters": map[string]int64{
 			"stream_bytes":    atomic.LoadInt64(&streamBytes),
@@ -434,8 +443,26 @@ func closeInheritedFDs() {
 	}
 }
 
+// raiseFileLimit 把软限制抬到硬限制：daemon 由 miniapp 拉起时继承的 fd 上限很小，
+// 弱网下并发连接一多就会 EMFILE，表现为「整机像断网」。启动时抬到硬上限并记日志。
+func raiseFileLimit() {
+	var lim syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+		return
+	}
+	if lim.Max > lim.Cur {
+		lim.Cur = lim.Max
+		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
+			log.Printf("[BiliDaemon] raise RLIMIT_NOFILE failed: %v (cur=%d max=%d)", err, lim.Cur, lim.Max)
+			return
+		}
+	}
+	log.Printf("[BiliDaemon] RLIMIT_NOFILE cur=%d max=%d", lim.Cur, lim.Max)
+}
+
 func main() {
 	closeInheritedFDs()
+	raiseFileLimit()
 	_ = os.MkdirAll(CoverDir, 0755)
 	loadHistory()
 	loadDownloads()

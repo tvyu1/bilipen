@@ -1,5 +1,31 @@
 # CHANGELOG
 
+## 3.0.1-netfix（2026-11-06）
+
+> 在 v3.0.1 原样基线上**只加网络稳定性修复**：前端文件与 v3.0.1 逐字节一致（`app.js 7559f843…`），版本号保持 3.0.1。
+
+### 背景
+校园弱网下「只能加载一次、之后像断网；删掉重装又能看一次；家里复现不了」。检查 daemon 后确认三处会累积到耗尽：
+- `apiClient`/`streamClient`/`downloadClient` 只设了 `MaxIdleConnsPerHost`，**没有 `MaxConnsPerHost`**：弱网下并发请求各自建连，无上限。
+- `cacheCoversAsync` 多个调用点按条目无界起 goroutine，**无并发上限、无同 bvid 去重**，每条最长占 10s。
+- daemon **从不调整 fd 上限**（继承 miniapp 的小限额）⇒ 连接一堆积就 `EMFILE`，此后连新 socket 都建不出来；重启 daemon 才恢复，与「重装能撑一次」吻合。
+- 附带：`signWbiQuery()` 在 key 缺失时同步拉 nav（10s），失败后每个签名请求都再等 10s。
+
+### 改动（仅 daemon，不动前端/播放/音频）
+1. 两个 Transport 补 `MaxConnsPerHost`（api/stream=8，download=6）。
+2. 封面下载 2 个并发槽 + 同 bvid 去重，排队 3s 拿不到就放弃本次。
+3. 启动时把 `RLIMIT_NOFILE` 软限制抬到硬限制并记日志。
+4. WBI key 拉取加 60s 失败退避。
+5. `/api/metrics` 增加 `goroutines` / `open_fds` / `cover_pending`，便于现场判断是否资源耗尽。
+
+### 产物
+| 项 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,794,654 B | `59b4c7f37cb55487473cbeb7b74620ce` |
+| 包内 `libs/arm/bili-daemon` | 6,422,663 B | `1f833c34aeac2d3f7066b823ab5a9fde` |
+| 包内 `app.js` | 210,237 B | `7559f8439cbaabba99b5874a7142ff3c`（= v3.0.1 原样） |
+
+
 ## v3.0.1（2026-10-28）
 
 > 修复版：把「起播先响声音再追画面」「弱网越纠越卡」「连点快进崩溃」「卡片上的删除点不到」这几个真机高频问题解决掉，并补上下载暂停与缓存/收藏的删改能力。
