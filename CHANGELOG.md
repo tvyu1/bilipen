@@ -1,5 +1,55 @@
 # CHANGELOG
 
+## v3.0.2（2026-11-05）
+
+> 固化版：把工作区里已在真机跑过、却一直没提交的改动固化成发布基线，并修掉复核发现的三个「看起来修了、其实没生效」的问题。
+
+### 修复：流代理空闲看门狗此前是死代码
+- `StreamIdleTimeout` 45s / `AudioIdleTimeout` 30s 都 ≥ `streamClient` 的 30s `Client.Timeout`（该超时覆盖整个 body 读取），所以新加的看门狗**永远等不到触发条件**：弱网卡死仍要等满 30s，日志里也不会出现 `stream idle`。
+- 阈值改为 video 20s / audio 15s（均 < 30s）；判活改用「最后一次成功 Read」与「最后一次成功 Write」两个时间戳的较新者——单 goroutine 里 Read/Write 串行，只看 Read 会把「下游写得慢」误判成「上游没数据」。
+- 触发时只 `cancel()` request context（transport 会关连接并唤醒阻塞中的 Read），不再重复 `Close` body。
+- 验证：交叉编译 + `go vet`（`GOOS=linux GOARCH=arm GOARM=7`）exit 0；**未在真机构造弱网卡死场景**，日志字段 `stream idle ... (limit ..., read ... / write ... ago)` 待真机确认。
+
+### 修复：听视频直出的 ffmpeg 可能变成孤儿，一直占着 hw:0,0
+- ffmpeg 以 `Setpgid` 独立进程组运行且无 `Pdeathsig`；只有 `/api/stop` 会收尾，而空闲 20 分钟 `os.Exit(0)`、`log.Fatalf`、`kill -9` 都绕过它 ⇒ 旧实例继续握着 ALSA，新 daemon 只能拿到 busy（前端回退厂商播放器后仍然无声）。
+- 现在 start 成功时把 pid 写入 `/userdisk/bili_alsa.pid`（与状态赋值同一把锁），stop/自然结束时删除；daemon 启动时 `reapStaleAlsa()` 先校验 `/proc/<pid>/cmdline` 确实是 ffmpeg，再按进程组 SIGKILL 回收，pid 被系统复用时跳过。
+- 未采用 `Pdeathsig`：Go 运行时会销毁/轮换 OS 线程，而 `Pdeathsig` 是在「创建它的线程退出」时触发，长连接播放有被误杀的风险（未验证）。
+- 验证：编译通过；**回收逻辑未在真机验证**（需部署后人为留一个孤儿进程再重启 daemon）。
+
+### 修复：cookie 原子写的失败分支
+- `os.WriteFile` 失败会留下半截 `.tmp`，现在删除后返回。
+- `chmod 0600` 失败不再继续 rename（否则「凭证收在 0600」的目标落空），改为放弃本次写入并清理。
+- 仍存在：固定 `.tmp` 名在并发 `saveCookie` 下可能交错（登录轮询与 buvid 回填都会触发），概率低，记入 README §十。
+
+### 修复：DASH 业务错误码被误报成「无 AVC 轨」
+- 版权/地区/风控等业务错误时 `data.dash` 本来就是空的，旧文案会归因成编码问题。现在先判 `pd.Code != 0` 并原样报出，再判编码。
+
+### 清理：app.js 的同步调参残留（运行时行为不变）
+- 删除恒为 0.0、三处 no-op、且注释指向不存在函数 `_syncBias` 的 `AUDIO_QUANT_BIAS`。
+- 死区注释改回代码事实 **±45ms**（此前一版注释写 ±120ms，与 `0.045` 阈值矛盾；120ms 在本项目的既有语义是「刹车步长上限」）。
+- 「音频速率 ≈0.93x」由「实测结论」降级为「未验证假设」——它与同文件另一处「0.93x 只是整数秒口径造成的假象」互相否定，二者不能都当实测。
+- 验证：`node --check frontend/app.js` 通过；常量本来就是 0.0，行为与改前逐字节等价。
+
+### 一并发布（上一轮已在真机验证、本次才提交）
+- **进度条**：`width:%` → `transform: scaleX()` + 450ms CSS 过渡；`_updateProgress` 200ms→500ms 且加 0.3% 死区；三元素去圆角。真机 12s 逐线程采样：`miniapp` 61%→44%，总计 68%→52%。
+- **构建可复现**：`go build` 加 `-buildvcs=false`；`os.walk` 排序；打包前 `rmtree`。同一源码连跑两次产物 md5 一致。
+- **DASH 只接受 AVC**（`codecid==7`）：设备 ffmpeg 4.4.1 解不了 AV1、HEVC 软解代价高；真实回归是离线下载画质静默降级，不是播放不可用（`resolveDash` 只被 `download.go` 调用）。
+- **Cookie**：`0600` + tmp/rename 原子写。
+- **听视频 ALSA 直出后端**：`/api/audio/alsa`、`/api/audio/alsa/status`、`/api/audio?variant=raw`。**前端尚未接入**，当前无用户影响。
+
+### 产物
+| 项 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,809,913 B | `e2fbdc43bcedb40938f399b4f424130f` |
+| 包内 `libs/arm/bili-daemon` | 6,422,663 B | `b37487afd8ec9fa63824c7f38cc52d17` |
+| 包内 `app.js` | 212,064 B | `924ef4bbb1183081161b3e1f369fccb7` |
+
+### 真机证据（2026-11-05，设备 `7FC2800009702019`）
+- 用设备上已安装的上一版构建（app.js `0d71cb5f…` / daemon `e44e23ed…`）做只读冒烟：首页渲染、点开视频实播、`/api/status` 返回 `playing=true`。
+- 140 帧连拍中进度条填充**起点恒为 x=62**（视频区左端），说明 `transformOrigin: "0 50%"` 被平台正确解析，没有回退成「从中间向两侧展开」。
+- 进度条位置与时间文本一致（`2:02/2:14` ↔ 91%），点进度条出现过 `跳转中 3:50` 并按 §4.4 clamp 到末尾。
+- **未验证**：450ms 过渡是否真的插值（`miniapp_cli captureFB` 在大循环里会挂起，50fps 采样没跑完）；seek 后 450ms 的「回放动画」是否可见。
+
 ## v3.0.1（2026-10-28）
 
 > 修复版：把「起播先响声音再追画面」「弱网越纠越卡」「连点快进崩溃」「卡片上的删除点不到」这几个真机高频问题解决掉，并补上下载暂停与缓存/收藏的删改能力。

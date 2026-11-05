@@ -16,7 +16,7 @@ import (
 )
 
 const (
-	Version     = "3.0.1"
+	Version     = "3.0.2"
 	Port        = 18080
 	UserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	BiliReferer = "https://www.bilibili.com/"
@@ -27,7 +27,9 @@ const (
 	FFmpegPath  = "/usr/bin/ffmpeg"
 	ChrtPath    = "/usr/bin/chrt"
 
-	StreamIdleTimeout = 45 * time.Second
+	// 两个 idle 阈值都必须小于 bili_api.go 里 streamClient 的 30s Client.Timeout：
+	// 该超时覆盖整个 body 读取，阈值 >=30s 时看门狗永远等不到触发条件（v3.0.2 前正是如此，等于死代码）。
+	StreamIdleTimeout = 20 * time.Second
 	PlayURLCacheTTL   = 10 * time.Minute
 	CacheDir          = "/userdisk/bili_cache"
 	CacheCapBytes     = int64(600 << 20)
@@ -35,7 +37,7 @@ const (
 	PrefetchWaitMax   = 1500 * time.Millisecond
 	SpoolRangeWaitMax = 2 * time.Second
 	PrefetchPlayingRate = int64(512 << 10)
-	AudioIdleTimeout  = 30 * time.Second
+	AudioIdleTimeout  = 15 * time.Second
 	CacheMaxAgeSecond = int64(7 * 24 * 3600)
 )
 
@@ -197,6 +199,7 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	cancelActiveAudio()
 	cancelAllStreams()
 	cancelAllSpool()
+	alsaPl.stop() // 听视频直出也在这里收尾，否则 ffmpeg 会一直占着 hw:0,0
 
 	log.Printf("[BiliDaemon] playback session stop")
 	w.Header().Set("Content-Type", "application/json")
@@ -436,6 +439,7 @@ func closeInheritedFDs() {
 
 func main() {
 	closeInheritedFDs()
+	reapStaleAlsa() // 上个 daemon 留下的直出 ffmpeg 会一直占着 hw:0,0
 	_ = os.MkdirAll(CoverDir, 0755)
 	loadHistory()
 	loadDownloads()
@@ -460,6 +464,8 @@ func main() {
 	mux.HandleFunc("/api/status", handleStatus)
 	mux.HandleFunc("/api/detail", handleDetail)
 	mux.HandleFunc("/api/audio", handleAudio)
+	mux.HandleFunc("/api/audio/alsa", handleAudioAlsa)
+	mux.HandleFunc("/api/audio/alsa/status", handleAudioAlsaStatus)
 	mux.HandleFunc("/api/alsa/ready", handleALSAReady)
 	mux.HandleFunc("/api/metrics", handleMetrics)
 	mux.HandleFunc("/api/volume", handleVolume)

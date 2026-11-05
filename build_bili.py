@@ -27,7 +27,7 @@ def build_daemon():
         return
     env = dict(os.environ)
     env.update({"GOOS": "linux", "GOARCH": "arm", "GOARM": "7", "CGO_ENABLED": "0"})
-    cmd = [go, "build", "-trimpath", "-ldflags", "-s -w -buildid=", "-o", out, "."]
+    cmd = [go, "build", "-trimpath", "-buildvcs=false", "-ldflags", "-s -w -buildid=", "-o", out, "."]
     subprocess.run(cmd, cwd=src_dir, env=env, check=True)
     print("[Build] bili-daemon = %d bytes" % os.path.getsize(out))
 
@@ -35,6 +35,8 @@ def build_daemon():
 build_daemon()
 
 # 1. Clean & prepare directory
+if os.path.isdir(PKG_DIR):
+    shutil.rmtree(PKG_DIR)
 os.makedirs(os.path.join(PKG_DIR, "libs", "arm"), exist_ok=True)
 
 # 2. Copy compiled binary & libraries
@@ -68,7 +70,7 @@ print("[Build] app.js copied from frontend/app.js (%d bytes)" % os.path.getsize(
 # 4. Manifest template
 manifest = {
     "appName": "笔上哔哩",
-    "version": "3.0.1",
+    "version": "3.0.2",
     "appid": "9002000869905604",
     "icon": "app_icon.png",
     "quickjs": {
@@ -92,7 +94,8 @@ def get_file_info(filepath):
         return len(data), hashlib.md5(data).hexdigest()
 
 for root, dirs, files in os.walk(PKG_DIR):
-    for file in files:
+    dirs.sort()
+    for file in sorted(files):
         if file == "manifest.json":
             continue
         full_path = os.path.join(root, file)
@@ -110,7 +113,8 @@ with open(manifest_path, 'w', encoding='utf-8') as f:
 # 6. Create ZIP (AMR)
 with zipfile.ZipFile(OUTPUT_AMR, 'w', zipfile.ZIP_DEFLATED) as z:
     for root, dirs, files in os.walk(PKG_DIR):
-        for file in files:
+        dirs.sort()
+        for file in sorted(files):
             full_path = os.path.join(root, file)
             rel_path = os.path.relpath(full_path, PKG_DIR).replace('\\', '/')
             zinfo = zipfile.ZipInfo(rel_path)

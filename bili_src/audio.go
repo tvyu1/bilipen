@@ -136,6 +136,14 @@ func handleAudio(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "audio: "+err.Error(), 502)
 		return
 	}
+	// variant=raw：直出原始 AAC（fMP4），不做 remux、不加黑帧视频轨。
+	// 听视频新模式把这条地址喂给 daemon 自己的 ffmpeg（/api/audio/alsa）。
+	// raw 与 ss 同时给时 raw 优先：裸 AAC 由消费端自己 seek，daemon 不再切片。
+	if r.URL.Query().Get("variant") == "raw" {
+		candidates := append([]string{au.url}, au.backups...)
+		proxyUpstream(w, r, "audio:"+bvid, candidates, "audio/mp4", AudioIdleTimeout, &audioBytes)
+		return
+	}
 	if r.URL.Query().Get("variant") == "remux" || ss != "" {
 		handleAudioRemux(w, r, bvid, au, ss)
 		return

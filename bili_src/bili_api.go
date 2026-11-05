@@ -210,8 +210,26 @@ func loadCookie() string {
 	return strings.TrimSpace(string(b))
 }
 
+// saveCookie 原子写 cookie（tmp + rename）并把权限收在 0600：
+// cookie 里的 SESSDATA / bili_jct 等价于账号凭据，不该让同机其他进程可读。
 func saveCookie(c string) {
-	_ = os.WriteFile(CookieFile, []byte(strings.TrimSpace(c)), 0644)
+	tmp := CookieFile + ".tmp"
+	if err := os.WriteFile(tmp, []byte(strings.TrimSpace(c)), 0o600); err != nil {
+		log.Printf("[BiliDaemon] save cookie tmp failed: %v", err)
+		_ = os.Remove(tmp) // 失败时可能已 O_TRUNC 出半截文件，留着会污染下次写入
+		return
+	}
+	// os.WriteFile 的 perm 只在新建时生效：显式 chmod，避免覆盖旧 0644 文件后仍是 0644。
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		// chmod 失败仍 rename 会让「凭证收在 0600」的目标落空，直接放弃这次写入
+		log.Printf("[BiliDaemon] chmod cookie tmp failed: %v", err)
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, CookieFile); err != nil {
+		log.Printf("[BiliDaemon] rename cookie failed: %v", err)
+		_ = os.Remove(tmp)
+	}
 }
 
 func clearCookie() {
@@ -1257,23 +1275,26 @@ func resolveDash(bvid string) (dashEntry, error) {
 		return dashEntry{}, err
 	}
 
-	// 1. Choose video: prefer AVC (codecid 7) and 360P (id 16) for lowest CPU & memory footprint
+	// 1. Choose video: AVC only (codecid 7), prefer 360P (id 16) for lowest CPU & memory footprint.
+	// 只接受 AVC：设备自带 ffmpeg 4.4.1 实测无法解 AV1（"Not yet implemented in FFmpeg"），
+	// HEVC 虽能软解但单核代价高。旧实现有 else-if 回退到任意编码，会静默把 AV1/HEVC 地址
+	// 写进离线文件，播放时才发现解不了 —— 现在跳过非 AVC，并在下面明确报错。
 	var bestV struct {
 		url     string
 		backups []string
 		codecid int
 		id      int
 	}
+	rejected := 0
 	for _, v := range pd.Data.Dash.Video {
 		if v.BaseUrl == "" {
 			continue
 		}
-		// Prefer AVC (codecid 7)
-		if v.Codecid == 7 {
-			if bestV.url == "" || v.Id == 16 || (bestV.id != 16 && v.Id < bestV.id) {
-				bestV.url, bestV.backups, bestV.codecid, bestV.id = v.BaseUrl, v.BackupUrl, v.Codecid, v.Id
-			}
-		} else if bestV.url == "" {
+		if v.Codecid != 7 {
+			rejected++
+			continue
+		}
+		if bestV.url == "" || v.Id == 16 || (bestV.id != 16 && v.Id < bestV.id) {
 			bestV.url, bestV.backups, bestV.codecid, bestV.id = v.BaseUrl, v.BackupUrl, v.Codecid, v.Id
 		}
 	}
@@ -1294,8 +1315,19 @@ func resolveDash(bvid string) (dashEntry, error) {
 		}
 	}
 
-	if bestV.url == "" || bestA.url == "" {
-		return dashEntry{}, fmt.Errorf("dash streams missing for %s (v=%v a=%v code=%d)", bvid, bestV.url != "", bestA.url != "", pd.Code)
+	if pd.Code != 0 {
+		// 版权/地区/风控等业务错误时 Dash 本来就是空的，先把它报出来，
+		// 否则会被下面「无 AVC 轨」的文案误导成编码问题（v3.0.2 前即如此）。
+		log.Printf("[BiliDaemon] dash for %s: api code=%d", bvid, pd.Code)
+		return dashEntry{}, fmt.Errorf("dash api error for %s: code=%d", bvid, pd.Code)
+	}
+	if bestV.url == "" {
+		log.Printf("[BiliDaemon] dash for %s has no AVC(codecid=7) video: %d non-AVC candidate(s) rejected (AV1 unsupported by device ffmpeg, HEVC too costly), code=%d",
+			bvid, rejected, pd.Code)
+		return dashEntry{}, fmt.Errorf("no AVC video stream for %s (codecid=7 required, %d non-AVC rejected; code=%d)", bvid, rejected, pd.Code)
+	}
+	if bestA.url == "" {
+		return dashEntry{}, fmt.Errorf("dash audio missing for %s (code=%d)", bvid, pd.Code)
 	}
 
 	entry := dashEntry{
