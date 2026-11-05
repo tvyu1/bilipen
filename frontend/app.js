@@ -2518,9 +2518,18 @@ var script = {
       this._audioSyncingPaused = true;
       this._audioParkCbAt = Date.now();
       try { if (this.audioPlayer && typeof this.audioPlayer.pause === 'function') this.audioPlayer.pause(); } catch (e) {}
+      // 兜底：放行条件依赖「视频位置追上音频」，而视频卡住时该位置根本不再前进，
+      // 音频会被无限期刹住（实测 park 后 5s 仍无 unpark，用户看到的就是「声音断了」）。
+      // 这里加 3s 硬超时，到点无论如何放行一次。
+      if (this._parkTimer) { try { this.$page.clearTimeout(this._parkTimer); } catch (e) {} }
+      this._parkTimer = this.$page.setTimeout(() => {
+        this._parkTimer = null;
+        if (this._audioSyncingPaused) this._unparkAudio('park-timeout');
+      }, 3000);
       console.warn('[Sync] park audio (' + why + ')');
     },
     _unparkAudio(why) {
+      if (this._parkTimer) { try { this.$page.clearTimeout(this._parkTimer); } catch (e) {} this._parkTimer = null; }
       if (!this._audioSyncingPaused) return;
       this._audioSyncingPaused = false;
       try { if (this.audioPlayer && typeof this.audioPlayer.resume === 'function') this.audioPlayer.resume(); } catch (e) {}
