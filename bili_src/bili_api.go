@@ -42,9 +42,6 @@ func newDownloadClient() *http.Client {
 			IdleConnTimeout:       30 * time.Second,
 			MaxIdleConns:          4,
 			MaxIdleConnsPerHost:   2,
-			// 显式上限：弱网下并发请求会各自开连接，不设上限时 fd 会被吃光，
-			// daemon 之后连新 socket 都建不出来（表现就是整机「无网络」）。
-			MaxConnsPerHost: 6,
 		},
 	}
 }
@@ -75,7 +72,6 @@ func newClient(timeout time.Duration) *http.Client {
 			IdleConnTimeout:       30 * time.Second,
 			MaxIdleConns:          8,
 			MaxIdleConnsPerHost:   4,
-			MaxConnsPerHost:       8,
 		},
 	}
 }
@@ -93,7 +89,6 @@ var (
 	wbiSubKey     string
 	wbiMixinKey   string
 	wbiKeysExpire time.Time
-	wbiLastFail   time.Time // 上次拉取 nav 失败的时刻：失败后 60s 内不再阻塞式重试
 	wbiMu         sync.Mutex
 )
 
@@ -131,30 +126,10 @@ func updateWbiKeysFromNav(imgURL, subURL string) {
 	log.Printf("[BiliDaemon] updated WBI mixin key")
 }
 
-// fetchWbiKeys 带失败退避：弱网下拉不到 nav 时，不能每次签名请求都阻塞 10s 重试，
-// 否则 feed / 搜索 / 详情会轮流卡满超时，现象上就是「所有接口都像没网」。
 func fetchWbiKeys() {
-	wbiMu.Lock()
-	if !wbiLastFail.IsZero() && time.Since(wbiLastFail) < time.Minute {
-		wbiMu.Unlock()
-		return
-	}
-	wbiMu.Unlock()
-	if fetchWbiKeysOnce() {
-		wbiMu.Lock()
-		wbiLastFail = time.Time{}
-		wbiMu.Unlock()
-		return
-	}
-	wbiMu.Lock()
-	wbiLastFail = time.Now()
-	wbiMu.Unlock()
-}
-
-func fetchWbiKeysOnce() bool {
 	req, err := http.NewRequest("GET", "https://api.bilibili.com/x/web-interface/nav", nil)
 	if err != nil {
-		return false
+		return
 	}
 	req.Header.Set("User-Agent", UserAgent)
 	req.Header.Set("Referer", BiliReferer)
@@ -163,7 +138,7 @@ func fetchWbiKeysOnce() bool {
 	}
 	resp, err := apiClient.Do(req)
 	if err != nil {
-		return false
+		return
 	}
 	defer resp.Body.Close()
 	var d struct {
@@ -175,13 +150,11 @@ func fetchWbiKeysOnce() bool {
 		} `json:"data"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&d); err != nil {
-		return false
+		return
 	}
 	if d.Data.WbiImg.ImgUrl != "" && d.Data.WbiImg.SubUrl != "" {
 		updateWbiKeysFromNav(d.Data.WbiImg.ImgUrl, d.Data.WbiImg.SubUrl)
-		return true
 	}
-	return false
 }
 
 func signWbiQuery(params url.Values) string {
@@ -237,51 +210,13 @@ func loadCookie() string {
 	return strings.TrimSpace(string(b))
 }
 
-// saveCookie 原子写 cookie（tmp + rename）并把权限收在 0600：
-// cookie 里的 SESSDATA / bili_jct 等价于账号凭据，不该让同机其他进程可读。
 func saveCookie(c string) {
-	tmp := CookieFile + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strings.TrimSpace(c)), 0o600); err != nil {
-		log.Printf("[BiliDaemon] save cookie tmp failed: %v", err)
-		_ = os.Remove(tmp) // 失败时可能已 O_TRUNC 出半截文件，留着会污染下次写入
-		return
-	}
-	// os.WriteFile 的 perm 只在新建时生效：显式 chmod，避免覆盖旧 0644 文件后仍是 0644。
-	if err := os.Chmod(tmp, 0o600); err != nil {
-		// chmod 失败仍 rename 会让「凭证收在 0600」的目标落空，直接放弃这次写入
-		log.Printf("[BiliDaemon] chmod cookie tmp failed: %v", err)
-		_ = os.Remove(tmp)
-		return
-	}
-	if err := os.Rename(tmp, CookieFile); err != nil {
-		log.Printf("[BiliDaemon] rename cookie failed: %v", err)
-		_ = os.Remove(tmp)
-	}
+	_ = os.WriteFile(CookieFile, []byte(strings.TrimSpace(c)), 0644)
 }
 
 func clearCookie() {
 	_ = os.Remove(CookieFile)
 }
-
-// 封面下载限流：弱网下每个请求最长占 10s，而 cacheCoversAsync 有 11 个调用点、
-// 每次按条目无界起 goroutine。不限制时协程与 TCP fd 会持续堆积，最终 daemon
-// 连新连接都开不出来（现象：先能加载一次，之后整机像断网，重启 daemon 又能撑一次）。
-var (
-	coverSem      = make(chan struct{}, 2) // 同时在飞的封面下载上限
-	coverMu       sync.Mutex
-	coverInflight = map[string]bool{} // 同 bvid 去重，避免重复下载
-)
-
-func acquireCoverSlot(timeout time.Duration) bool {
-	select {
-	case coverSem <- struct{}{}:
-		return true
-	case <-time.After(timeout):
-		return false
-	}
-}
-
-func releaseCoverSlot() { <-coverSem }
 
 func cacheCover(bvid, picUrl string) string {
 	if picUrl == "" {
@@ -292,30 +227,11 @@ func cacheCover(bvid, picUrl string) string {
 	if fi, err := os.Stat(localPath); err == nil && fi.Size() > 512 {
 		return "covers/" + localName
 	}
-	coverMu.Lock()
-	if coverInflight[bvid] {
-		coverMu.Unlock()
-		return "" // 同一封面已在下载中，交给那一趟
-	}
-	coverInflight[bvid] = true
-	coverMu.Unlock()
-	defer func() {
-		coverMu.Lock()
-		delete(coverInflight, bvid)
-		coverMu.Unlock()
-	}()
-	if !acquireCoverSlot(3 * time.Second) {
-		return "" // 排队超时：宁可这次不缓存，也不要把 fd 堆起来
-	}
-	defer releaseCoverSlot()
 	req, err := http.NewRequest("GET", picUrl, nil)
 	if err != nil {
 		return ""
 	}
 	req.Header.Set("User-Agent", UserAgent)
-	// B 站图床对无 Referer 的请求会 403/301：缺这个头时封面缓存永远失败，
-	// 前端只能退回 CDN 直连，而设备运行时既不补 Referer 也不跟跳转（实测 115 次 ERROR）。
-	req.Header.Set("Referer", BiliReferer)
 	resp, err := apiClient.Do(req)
 	if err != nil {
 		return ""
@@ -731,13 +647,6 @@ func handleProxyCover(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "missing url", 400)
 		return
 	}
-	// 与 cacheCover 共用同一组槽位：前端一屏就有 8 张图，弱网下不限流会把
-	// daemon 的连接/fd 全部占死，后续所有接口都表现为「无网络」。
-	if !acquireCoverSlot(3 * time.Second) {
-		http.Error(w, "cover busy", http.StatusServiceUnavailable)
-		return
-	}
-	defer releaseCoverSlot()
 	if strings.HasPrefix(raw, "//") {
 		raw = "https:" + raw
 	}
@@ -1348,26 +1257,23 @@ func resolveDash(bvid string) (dashEntry, error) {
 		return dashEntry{}, err
 	}
 
-	// 1. Choose video: AVC only (codecid 7), prefer 360P (id 16) for lowest CPU & memory footprint.
-	// 只接受 AVC：设备自带 ffmpeg 4.4.1 实测无法解 AV1（"Not yet implemented in FFmpeg"），
-	// HEVC 虽能软解但单核代价高。旧实现有 else-if 回退到任意编码，会静默把 AV1/HEVC 地址
-	// 写进离线文件，播放时才发现解不了 —— 现在跳过非 AVC，并在下面明确报错。
+	// 1. Choose video: prefer AVC (codecid 7) and 360P (id 16) for lowest CPU & memory footprint
 	var bestV struct {
 		url     string
 		backups []string
 		codecid int
 		id      int
 	}
-	rejected := 0
 	for _, v := range pd.Data.Dash.Video {
 		if v.BaseUrl == "" {
 			continue
 		}
-		if v.Codecid != 7 {
-			rejected++
-			continue
-		}
-		if bestV.url == "" || v.Id == 16 || (bestV.id != 16 && v.Id < bestV.id) {
+		// Prefer AVC (codecid 7)
+		if v.Codecid == 7 {
+			if bestV.url == "" || v.Id == 16 || (bestV.id != 16 && v.Id < bestV.id) {
+				bestV.url, bestV.backups, bestV.codecid, bestV.id = v.BaseUrl, v.BackupUrl, v.Codecid, v.Id
+			}
+		} else if bestV.url == "" {
 			bestV.url, bestV.backups, bestV.codecid, bestV.id = v.BaseUrl, v.BackupUrl, v.Codecid, v.Id
 		}
 	}
@@ -1388,19 +1294,8 @@ func resolveDash(bvid string) (dashEntry, error) {
 		}
 	}
 
-	if pd.Code != 0 {
-		// 版权/地区/风控等业务错误时 Dash 本来就是空的，先把它报出来，
-		// 否则会被下面「无 AVC 轨」的文案误导成编码问题（v3.0.2 前即如此）。
-		log.Printf("[BiliDaemon] dash for %s: api code=%d", bvid, pd.Code)
-		return dashEntry{}, fmt.Errorf("dash api error for %s: code=%d", bvid, pd.Code)
-	}
-	if bestV.url == "" {
-		log.Printf("[BiliDaemon] dash for %s has no AVC(codecid=7) video: %d non-AVC candidate(s) rejected (AV1 unsupported by device ffmpeg, HEVC too costly), code=%d",
-			bvid, rejected, pd.Code)
-		return dashEntry{}, fmt.Errorf("no AVC video stream for %s (codecid=7 required, %d non-AVC rejected; code=%d)", bvid, rejected, pd.Code)
-	}
-	if bestA.url == "" {
-		return dashEntry{}, fmt.Errorf("dash audio missing for %s (code=%d)", bvid, pd.Code)
+	if bestV.url == "" || bestA.url == "" {
+		return dashEntry{}, fmt.Errorf("dash streams missing for %s (v=%v a=%v code=%d)", bvid, bestV.url != "", bestA.url != "", pd.Code)
 	}
 
 	entry := dashEntry{
@@ -1479,15 +1374,6 @@ func handleDetail(w http.ResponseWriter, r *http.Request) {
 	// 旧实现会对每个被点开的详情页把整段视频落盘到 /userdisk/bili_cache，
 	// 用户只是浏览也会产生数十 MB 的 eMMC 写与单核抢占（v2.4.7 审计 D-01）。
 	// 预取改由"真正开始播放"时经 handleStream → ensureSpool 触发。
-	//
-	// 但可以预热两个「纯 JSON」接口：playurl 与音轨解析都只是 API 往返、不落盘，
-	// 实测起播首帧前会多付 0.5~1.5s。这里后台跑，失败静默（弱网下不影响页面）。
-	go func(id string) {
-		if _, _, err := resolvePlayURL(id); err != nil {
-			return
-		}
-		_, _ = resolveAudio(id)
-	}(bvid)
 
 	// 三连状态（未登录返回 null，前端据此把按钮置灰）
 	var relation interface{}

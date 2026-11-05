@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,7 +16,7 @@ import (
 )
 
 const (
-	Version     = "3.0.8"
+	Version     = "3.0.1"
 	Port        = 18080
 	UserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	BiliReferer = "https://www.bilibili.com/"
@@ -28,9 +27,7 @@ const (
 	FFmpegPath  = "/usr/bin/ffmpeg"
 	ChrtPath    = "/usr/bin/chrt"
 
-	// 两个 idle 阈值都必须小于 bili_api.go 里 streamClient 的 30s Client.Timeout：
-	// 该超时覆盖整个 body 读取，阈值 >=30s 时看门狗永远等不到触发条件（v3.0.2 前正是如此，等于死代码）。
-	StreamIdleTimeout = 20 * time.Second
+	StreamIdleTimeout = 45 * time.Second
 	PlayURLCacheTTL   = 10 * time.Minute
 	CacheDir          = "/userdisk/bili_cache"
 	CacheCapBytes     = int64(600 << 20)
@@ -38,7 +35,7 @@ const (
 	PrefetchWaitMax   = 1500 * time.Millisecond
 	SpoolRangeWaitMax = 2 * time.Second
 	PrefetchPlayingRate = int64(512 << 10)
-	AudioIdleTimeout  = 15 * time.Second
+	AudioIdleTimeout  = 30 * time.Second
 	CacheMaxAgeSecond = int64(7 * 24 * 3600)
 )
 
@@ -200,7 +197,6 @@ func handleStop(w http.ResponseWriter, r *http.Request) {
 	cancelActiveAudio()
 	cancelAllStreams()
 	cancelAllSpool()
-	alsaPl.stop() // 听视频直出也在这里收尾，否则 ffmpeg 会一直占着 hw:0,0
 
 	log.Printf("[BiliDaemon] playback session stop")
 	w.Header().Set("Content-Type", "application/json")
@@ -394,20 +390,12 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 	spoolMu.Unlock()
 
-	openFDs := 0
-	if entries, err := os.ReadDir("/proc/self/fd"); err == nil {
-		openFDs = len(entries)
-	}
-
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"version":          Version,
 		"uptime":           time.Since(startedAt).Truncate(time.Second).String(),
 		"load1":            load1,
 		"mem_available_kb": memFree,
-		"goroutines":       runtime.NumGoroutine(),
-		"open_fds":         openFDs,
-		"cover_pending":    len(coverSem),
 		"spools":           list,
 		"counters": map[string]int64{
 			"stream_bytes":    atomic.LoadInt64(&streamBytes),
@@ -446,27 +434,8 @@ func closeInheritedFDs() {
 	}
 }
 
-// raiseFileLimit 把软限制抬到硬限制：daemon 由 miniapp 拉起时继承的 fd 上限很小，
-// 弱网下并发连接一多就会 EMFILE，表现为「整机像断网」。启动时抬到硬上限并记日志。
-func raiseFileLimit() {
-	var lim syscall.Rlimit
-	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
-		return
-	}
-	if lim.Max > lim.Cur {
-		lim.Cur = lim.Max
-		if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &lim); err != nil {
-			log.Printf("[BiliDaemon] raise RLIMIT_NOFILE failed: %v (cur=%d max=%d)", err, lim.Cur, lim.Max)
-			return
-		}
-	}
-	log.Printf("[BiliDaemon] RLIMIT_NOFILE cur=%d max=%d", lim.Cur, lim.Max)
-}
-
 func main() {
 	closeInheritedFDs()
-	raiseFileLimit()
-	reapStaleAlsa() // 上个 daemon 留下的直出 ffmpeg 会一直占着 hw:0,0
 	_ = os.MkdirAll(CoverDir, 0755)
 	loadHistory()
 	loadDownloads()
@@ -491,8 +460,6 @@ func main() {
 	mux.HandleFunc("/api/status", handleStatus)
 	mux.HandleFunc("/api/detail", handleDetail)
 	mux.HandleFunc("/api/audio", handleAudio)
-	mux.HandleFunc("/api/audio/alsa", handleAudioAlsa)
-	mux.HandleFunc("/api/audio/alsa/status", handleAudioAlsaStatus)
 	mux.HandleFunc("/api/alsa/ready", handleALSAReady)
 	mux.HandleFunc("/api/metrics", handleMetrics)
 	mux.HandleFunc("/api/volume", handleVolume)

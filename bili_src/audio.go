@@ -136,14 +136,6 @@ func handleAudio(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "audio: "+err.Error(), 502)
 		return
 	}
-	// variant=raw：直出原始 AAC（fMP4），不做 remux、不加黑帧视频轨。
-	// 听视频新模式把这条地址喂给 daemon 自己的 ffmpeg（/api/audio/alsa）。
-	// raw 与 ss 同时给时 raw 优先：裸 AAC 由消费端自己 seek，daemon 不再切片。
-	if r.URL.Query().Get("variant") == "raw" {
-		candidates := append([]string{au.url}, au.backups...)
-		proxyUpstream(w, r, "audio:"+bvid, candidates, "audio/mp4", AudioIdleTimeout, &audioBytes)
-		return
-	}
 	if r.URL.Query().Get("variant") == "remux" || ss != "" {
 		handleAudioRemux(w, r, bvid, au, ss)
 		return
@@ -179,8 +171,6 @@ func handleAudioRemux(w http.ResponseWriter, r *http.Request, bvid string, au au
 		"-i", au.url,
 		"-f", "lavfi", "-i", "color=c=black:s=160x90:r=1",
 		"-map", "0:a:0", "-map", "1:v:0",
-		// 曾尝试转码 48k/2ch 去对齐设备 ALSA，但真机日志显示音频播放器只收到 1377 字节就断开
-		// （vendor 侧直接丢弃该流），并伴随进播放页无响应；v3.0.7 起回退为原样 copy。
 		"-c:a", "copy",
 		"-c:v", "mpeg4", "-q:v", "31", "-g", "1",
 		"-shortest",
@@ -299,8 +289,6 @@ func handleLocalAudioRemux(w http.ResponseWriter, r *http.Request, bvid, localPa
 		"-i", localPath,
 		"-f", "lavfi", "-i", "color=c=black:s=160x90:r=1",
 		"-map", "0:a:0", "-map", "1:v:0",
-		// 曾尝试转码 48k/2ch 去对齐设备 ALSA，但真机日志显示音频播放器只收到 1377 字节就断开
-		// （vendor 侧直接丢弃该流），并伴随进播放页无响应；v3.0.7 起回退为原样 copy。
 		"-c:a", "copy",
 		"-c:v", "mpeg4", "-q:v", "31", "-g", "1",
 		"-shortest",

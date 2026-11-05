@@ -626,57 +626,12 @@ func proxyUpstream(w http.ResponseWriter, r *http.Request, bvid string, candidat
 	w.WriteHeader(resp.StatusCode)
 
 	buf := make([]byte, 64*1024)
-
-	// 空闲看门狗：idleTimeout 之前只是形参（从没被用过），而这条路径的兜底只有
-	// streamClient 的 30s 总超时 —— 弱网卡死时要等满 30s 才报错，且日志里看不出原因。
-	// 判定用「读」与「写」两个时间戳的较新者：单 goroutine 里 Read 与 Write 串行，
-	// 只看 Read 会把「下游写得慢」误判成「上游没数据」。超过 idleTimeout 无进展则
-	// 取消 request context（transport 会关连接并让阻塞中的 Read 返回），并留明确日志。
-	var lastByteNano int64 = time.Now().UnixNano()   // 最后一次从上游读到字节
-	var lastWriteNano int64 = lastByteNano           // 最后一次成功写向下游
-	if idleTimeout > 0 {
-		stopWD := make(chan struct{})
-		defer close(stopWD)
-		go func() {
-			iv := idleTimeout / 4
-			if iv < time.Second {
-				iv = time.Second
-			}
-			if iv > 5*time.Second {
-				iv = 5 * time.Second
-			}
-			t := time.NewTicker(iv)
-			defer t.Stop()
-			for {
-				select {
-				case <-stopWD:
-					return
-				case <-t.C:
-					idleRead := time.Since(time.Unix(0, atomic.LoadInt64(&lastByteNano)))
-					idleWrite := time.Since(time.Unix(0, atomic.LoadInt64(&lastWriteNano)))
-					idle := idleRead
-					if idleWrite < idle {
-						idle = idleWrite
-					}
-					if idle > idleTimeout {
-						log.Printf("[BiliDaemon] stream idle %v (limit %v, read %v / write %v ago), abort %s",
-							idle.Truncate(time.Second), idleTimeout, idleRead.Truncate(time.Second), idleWrite.Truncate(time.Second), bvid)
-						cancel() // 取消 request context 即可让阻塞中的 Read 返回，无需再 Close body
-						return
-					}
-				}
-			}
-		}()
-	}
-
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			atomic.StoreInt64(&lastByteNano, time.Now().UnixNano())
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				return
 			}
-			atomic.StoreInt64(&lastWriteNano, time.Now().UnixNano())
 			if counter != nil {
 				atomic.AddInt64(counter, int64(n))
 			}

@@ -10,9 +10,6 @@ var OUT_ALIGN_DISPLAY = true;
 // 按 Rockchip FAQ（A1.7/A2.21）每次 blit 都会被内核强制同步 cache，
 // 净收益为负（draws/s 30→27、maxgap 48→150ms）。默认关闭，保留开关供后续换 uncached heap 再试。
 var USE_RGA = false;
-// 厂商 onPosition 回传的是整数秒（floor），单次采样天然带 -0.5s 量级的量化噪声；
-// 闭环用 EWMA + 死区吸收这类噪声，不引入恒定偏置常量
-// （v3.0.2 前这里有一个恒为 0.0、注释还指向不存在函数的 AUDIO_QUANT_BIAS，已删除）。
 
 function safeJson(body, fallback) {
   if (body === null || body === undefined || body === '') return fallback;
@@ -1149,26 +1146,19 @@ var script = {
     _updateProgress() {
       if (!this.isPlaying || this.audioMode) return;
       const now = Date.now();
-      // 500ms + CSS transition 插值：写入次数从 5 次/秒降到 2 次/秒，
-      // 进度条靠 transform 过渡补间（transform 在平台 transition 白名单内），
-      // 观感比原来"每 200ms 重排一次 width"更顺，且每次都是整树 diff，越少越好。
-      if (now - (this._progAt || 0) < 500) return;
+      // 200ms + 0.1s 死区：旧实现 400ms/0.2s 会让进度条每 0.4s 跳一格，观感很卡
+      if (now - (this._progAt || 0) < 200) return;
       this._progAt = now;
       // 拖动中才冻结刷新；_seekPreview 若因设备不送 touchend 而残留，由下面的看门狗清掉
       if (this._progressDragging) return;
       const pos = this._lastPos || 0;
       const dur = this.vDuration || 0;
-      // 时间文本只需整秒精度：变化 <1s 不写，避免无意义重渲染
-      if (pos > 0 && Math.abs(pos - (this.curPos || 0)) >= 1.0) this.curPos = pos;
+      if (pos > 0 && Math.abs(pos - (this.curPos || 0)) >= 0.1) this.curPos = pos;
       if (dur > 0) {
         let p = pos / dur;
         if (!isFinite(p) || p < 0) p = 0;
         if (p > 1) p = 1;
-        // 变化不足 0.3% 不写（长视频下大部分 tick 会被这里挡掉）
-        if (Math.abs(p - (this._progLast == null ? -1 : this._progLast)) >= 0.003) {
-          this._progLast = p;
-          this.progress = p;
-        }
+        this.progress = p;
       }
     },
     formatCount(n) {
@@ -2175,10 +2165,6 @@ var script = {
                 // 触发一次 fast catch-up 疯狂跳帧。这里必须补回偏移。
                 const videoNow = (this._seekOffset || 0) + info.position;
                 const rawDrift = audioNow - videoNow; // >0 视频落后需跳帧；<0 视频超前需等待
-                // 注（未验证假设）：某次 60s 窗口里音频比视频落后 4.4s（≈0.93x），若成立，
-                // 下方「每秒一次 lead-brake」就是在补偿真实速率差而非误判；但这是一次性记录，
-                // 且与上文「0.93x 只是整数秒口径造成的假象」互相矛盾，定案前不要据此改控制器。
-                // 定案方法：在 [Sync] 日志里补 _acSlope 字段，跑一次 60s 看斜率是否稳定偏离 1.0。
 
                 // 大偏差处理：只要 |drift| > 1s 就累计 strike，连续 3 次即做一次硬重同步。
                 // 旧实现在 >2s 时「清空滤波什么都不做」，结果视频卡顿 2.9s 后音频跑前 5s，
@@ -2227,12 +2213,10 @@ var script = {
                     // 冷却：小偏差 1000ms；大偏差 700ms（要追 1s 以上不能等）
                     const cooldownMs = Math.abs(this._driftEwma) > 0.5 ? 700 : 1000;
                     if (elapsedSinceAdjust >= cooldownMs) {
-                      // 对称死区 ±45ms：厂商 onPosition 为整数秒，单次 drift 的量化噪声可达 ±0.5s，
-                      // 闭环只在 |EWMA| 超过 45ms 时纠正，避免在噪声里反复 adjust。
-                      // （v3.0.1 起的设计值，见 CHANGELOG v2.4.12；曾有一版注释误写成 ±120ms，
-                      //  120ms 在本项目里的既有语义是「刹车步长上限」，两者不是一回事。）
+                      // 对称死区 ±45ms：时钟估计精度提升到 ~50ms 后，旧的非对称死区（+90/−180ms）
+                      // 已经把两个方向都放成了死区，负向更是完全不动（见下一处注释）。
                       if (this._driftEwma > 0.045) {
-                        // 视频滞后音频 > 45ms: 温和追赶，比例调节 min(max(ewma*0.5, 30ms), 50ms)
+                        // 视频滞后音频 > 90ms: 温和追赶，比例调节 min(max(ewma*0.5, 30ms), 50ms)
                         // 与 native 300ms 环形缓冲溢出丢帧串联互补：90ms~300ms 由控制器主动拉回，杜绝无干预空档
                         // 小偏差温和（≤50ms）；大偏差放大步长快速收敛（视频落后→跳帧，安全上限 400ms）
                         const mag = this._driftEwma;
@@ -2246,7 +2230,7 @@ var script = {
                           console.warn('[Sync] adjust error: ' + e);
                         }
                       } else if (this._driftEwma < -0.045) {
-                        // 视频超前音频 > 45ms 时微量刹车（负向是「等一等」，上限 120ms 避免定格）
+                        // 视频超前音频 > 180ms（超出人类视听感知极限 +185ms 时微量刹车）
                         // 注意：旧值 -0.020 在 native 侧是空操作（判定是 d < -0.02，等于没生效），
                         // 所以「刹车」从来没真正执行过。改为 -0.030（一次 30ms 的轻微等待，不会定格）。
                         // 负向是「等一等」（native 侧 t0 += |d|，会造成最多一次 |d| 的停顿），
@@ -2262,7 +2246,7 @@ var script = {
                           console.warn('[Sync] adjust error: ' + e);
                         }
                       }
-                      // 注：-0.045s ~ +0.045s 属于采样噪声死区，完全不调用 adjust()，保持画面极致流畅！
+                      // 注：-0.180s ~ +0.090s 属于感知与采样死区，完全不调用 adjust()，保持画面极致流畅！
                     }
                   }
                 }
@@ -2500,7 +2484,7 @@ var script = {
       if (this._acSlope > 0 && (this._acSamples || []).length >= 4) {
         const v = this._acSlope * tms + this._acIntercept;
         if (v > (this._acLast || 0)) this._acLast = v;
-        return (this._acLast || v);
+        return this._acLast || v;
       }
       const base = this._audioPos || 0;
       const baseAt = this._audioPosAt || 0;
@@ -2518,18 +2502,9 @@ var script = {
       this._audioSyncingPaused = true;
       this._audioParkCbAt = Date.now();
       try { if (this.audioPlayer && typeof this.audioPlayer.pause === 'function') this.audioPlayer.pause(); } catch (e) {}
-      // 兜底：放行条件依赖「视频位置追上音频」，而视频卡住时该位置根本不再前进，
-      // 音频会被无限期刹住（实测 park 后 5s 仍无 unpark，用户看到的就是「声音断了」）。
-      // 这里加 3s 硬超时，到点无论如何放行一次。
-      if (this._parkTimer) { try { this.$page.clearTimeout(this._parkTimer); } catch (e) {} }
-      this._parkTimer = this.$page.setTimeout(() => {
-        this._parkTimer = null;
-        if (this._audioSyncingPaused) this._unparkAudio('park-timeout');
-      }, 3000);
       console.warn('[Sync] park audio (' + why + ')');
     },
     _unparkAudio(why) {
-      if (this._parkTimer) { try { this.$page.clearTimeout(this._parkTimer); } catch (e) {} this._parkTimer = null; }
       if (!this._audioSyncingPaused) return;
       this._audioSyncingPaused = false;
       try { if (this.audioPlayer && typeof this.audioPlayer.resume === 'function') this.audioPlayer.resume(); } catch (e) {}
@@ -3047,8 +3022,8 @@ var script = {
       if (x === null || y === null) return null;
       return { x: x, y: y };
     },
-    // 进度条只做展示：点击跳转已移除，跳转只保留 -10/+10 两个按钮。
-    _removedHandleProgressSeek(e) {
+    // 进度条只支持「点击跳转」，已移除拖动 seek（设备触摸事件不稳，容易误触发连续重开解码）
+    _handleProgressSeek(e) {
       if (!this.isPlaying || !this.vDuration || this.vDuration <= 0) return;
       if (this.playerState === 'loading' || this.playerState === 'seeking' || this.playerState === 'error') return;
       // 与 ctrl-bar 固定布局一致：4(padding)+30+2+24+2 = 62；轨道宽 150。
@@ -3067,7 +3042,11 @@ var script = {
       console.warn('[Seek] progress tap: pct=' + pct.toFixed(3) + ' targetSec=' + targetSec + ' / ' + this.vDuration);
       this.seekTo(targetSec);
     },
-
+    onProgressClick(e) {
+      if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+      this._showCtrlBar();
+      this._handleProgressSeek(e);
+    },
     seekTo(targetSec) {
       if (this.isStopping || !this.isPlaying) return;
       const item = this._playItem || this.detailItem();
@@ -3677,6 +3656,7 @@ var style_0 = { "_": {
     "height": "12px",
     "marginRight": "2px",
     "backgroundColor": "rgba(255,255,255,0.28)",
+    "borderRadius": "6px",
     "justifyContent": "center",
     "overflow": "hidden"
   },
@@ -3685,24 +3665,16 @@ var style_0 = { "_": {
     "left": "0px",
     "top": "0px",
     "height": "12px",
-    "width": "100%",
     "backgroundColor": "rgba(255,255,255,0.38)",
-    "transformOrigin": "0 50%",
-    "transitionProperty": "transform",
-    "transitionDuration": "450ms",
-    "transitionTimingFunction": "linear"
+    "borderRadius": "6px"
   },
   "ctrl-fill": {
     "position": "absolute",
     "left": "0px",
     "top": "2px",
     "height": "8px",
-    "width": "100%",
     "backgroundColor": "#fb7299",
-    "transformOrigin": "0 50%",
-    "transitionProperty": "transform",
-    "transitionDuration": "450ms",
-    "transitionTimingFunction": "linear"
+    "borderRadius": "4px"
   },
   "ctrl-time": {
     "width": "56px",
@@ -4949,12 +4921,14 @@ var render = function () {
         _c('div', { staticClass: ["ctrl-btn", "ctrl-btn-sm"], on: { "click": function () { _vm.seekRelative(-10); } } }, [
           _c('text', { staticClass: ["ctrl-btn-text"] }, [_vm._v("-10")])
         ]),
-        // 进度条只做展示（点击快进已移除，跳转只保留 -10/+10）
         _c('div', {
-          staticClass: ["ctrl-track"]
+          staticClass: ["ctrl-track"],
+          on: {
+            "click": function ($event) { _vm.onProgressClick($event); }
+          }
         }, [
-          _c('div', { staticClass: ["ctrl-buf"], style: { transform: 'scaleX(' + ((_vm.streamPct >= 0 ? _vm.streamPct : 0) / 100) + ')' } }),
-          _c('div', { staticClass: ["ctrl-fill"], style: { transform: 'scaleX(' + (_vm.progress || 0) + ')' } })
+          _c('div', { staticClass: ["ctrl-buf"], style: { width: (_vm.streamPct >= 0 ? _vm.streamPct : 0) + '%' } }),
+          _c('div', { staticClass: ["ctrl-fill"], style: { width: Math.round((_vm.progress || 0) * 100) + '%' } })
         ]),
         _c('div', { staticClass: ["ctrl-btn", "ctrl-btn-sm"], on: { "click": function () { _vm.seekRelative(10); } } }, [
           _c('text', { staticClass: ["ctrl-btn-text"] }, [_vm._v("+10")])
