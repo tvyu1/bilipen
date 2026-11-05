@@ -246,6 +246,15 @@ var script = {
   onUnload() {
     console.warn('[Lifecycle] vm onUnload, stop playback');
     try { this.stop(); } catch (e) {}
+    // 释放厂商模块引用：只要还有 JS 侧引用，jsapi_check_unload 就一直返回 0，
+    // 运行时会每 2s 重试卸载（实测重试 1400+ 次），并让下次进入播放页变慢/卡死。
+    try { this.rgav = null; } catch (e) {}
+    try { this.vPlayer = null; } catch (e) {}
+    try { this.audioPlayer = null; } catch (e) {}
+    try { this._audioBind = []; } catch (e) {}
+    try { this._audioBuffer = null; } catch (e) {}
+    try { this._audioImageData = null; } catch (e) {}
+    try { this.imageData = null; } catch (e) {}
     try { this._cancelTextEdit(); } catch (e) {}
     try { this._unbindTextEditFinished(); } catch (e) {}
   },
@@ -2975,6 +2984,13 @@ var script = {
         }).catch(() => {});
       } catch (e) {}
       this._stopNative();
+      // 关键：native 解码线程由 rgav 持有。以前这里只停 vPlayer/音频、漏了 rgav，
+      // 于是离开播放页后线程一直活着 → jsapi_check_unload 永远返回 0 → 厂商运行时
+      // 每 2s 重试卸载模块（实测重试 1400+ 次）；再次进播放页时 js_start 又要 join
+      // 旧线程（最多 8s），表现就是「进播放就点不动」。
+      if (this.rgav && typeof this.rgav.stop === 'function') {
+        try { this.rgav.stop(); } catch (e) { console.warn('[Rga] stop error: ' + e); }
+      }
       // 更新观看历史：记录本次播放停止时的进度与时长。
       try {
         if (this._playItem) this.recordHistory(this._playItem, this._lastPos || this.curPos || 0, this.vDuration || 0);
@@ -3044,31 +3060,7 @@ var script = {
       if (x === null || y === null) return null;
       return { x: x, y: y };
     },
-    // 进度条只支持「点击跳转」，已移除拖动 seek（设备触摸事件不稳，容易误触发连续重开解码）
-    _handleProgressSeek(e) {
-      if (!this.isPlaying || !this.vDuration || this.vDuration <= 0) return;
-      if (this.playerState === 'loading' || this.playerState === 'seeking' || this.playerState === 'error') return;
-      // 与 ctrl-bar 固定布局一致：4(padding)+30+2+24+2 = 62；轨道宽 150。
-      const PROG_X = 62;
-      const PROG_W = 150;
-      let pct = -1;
-      if (e && typeof e.offsetX === 'number' && e.offsetX >= 0 && e.offsetX <= PROG_W + 4) {
-        pct = e.offsetX / PROG_W;
-      } else {
-        const p = this.readTouchPoint(e);
-        if (p && typeof p.x === 'number') pct = (p.x - PROG_X) / PROG_W;
-      }
-      if (pct < 0) return;
-      if (pct > 1) pct = 1;
-      const targetSec = Math.max(0, Math.round(pct * this.vDuration));
-      console.warn('[Seek] progress tap: pct=' + pct.toFixed(3) + ' targetSec=' + targetSec + ' / ' + this.vDuration);
-      this.seekTo(targetSec);
-    },
-    onProgressClick(e) {
-      if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
-      this._showCtrlBar();
-      this._handleProgressSeek(e);
-    },
+    // 进度条只做展示：点击快进已移除（设备触摸事件不稳，只保留 -10/+10 按钮跳转）。
     seekTo(targetSec) {
       if (this.isStopping || !this.isPlaying) return;
       const item = this._playItem || this.detailItem();
@@ -4950,11 +4942,9 @@ var render = function () {
         _c('div', { staticClass: ["ctrl-btn", "ctrl-btn-sm"], on: { "click": function () { _vm.seekRelative(-10); } } }, [
           _c('text', { staticClass: ["ctrl-btn-text"] }, [_vm._v("-10")])
         ]),
+        // 进度条只做展示：点击快进已移除（设备触摸事件不稳，容易误触发连续 seek）。
         _c('div', {
-          staticClass: ["ctrl-track"],
-          on: {
-            "click": function ($event) { _vm.onProgressClick($event); }
-          }
+          staticClass: ["ctrl-track"]
         }, [
           _c('div', { staticClass: ["ctrl-buf"], style: { transform: 'scaleX(' + ((_vm.streamPct >= 0 ? _vm.streamPct : 0) / 100) + ')' } }),
           _c('div', { staticClass: ["ctrl-fill"], style: { transform: 'scaleX(' + (_vm.progress || 0) + ')' } })
