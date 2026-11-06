@@ -1,5 +1,36 @@
 # CHANGELOG
 
+## 3.0.1-dnsfix（2026-11-06）
+
+> 上午日志定位到「像断网」的真实原因：**设备 DNS 解析失败**，不是 fd 耗尽。仍基于 v3.0.1，前端未改动。
+
+### 证据（2026-11-06 11:24–12:13）
+- daemon：`feed WBI upstream error: ... dial tcp4: lookup api.bilibili.com on 192.168.1.1:53: no such host`，随后回退缓存 feed。
+- 同一时段全量应用日志里 `Could not resolve / no such host / Resolving time out` 共 **191 次**，且不限于 bili（有道自家域名、`rlogs`、`hardware-*` 同样失败）⇒ 是设备级 DNS 不可用。
+- 设备 `/etc/resolv.conf` 由 DHCP 生成，出问题时只有 `192.168.1.1` 一个不可用条目。
+
+### 修复（仅 daemon）
+1. **公共 DNS 兜底**：系统解析失败后依次尝试 `223.5.5.5` / `119.29.29.29` / `8.8.8.8`，解析成功即用该 IP 直连（TLS SNI 与 Host 头不受影响）。
+2. **解析缓存 10 分钟**：避免短时抖动让同一域名反复失败。
+3. **两级解析都限时**（系统 2.5s、每台公共 DNS 2.5s）：resolv.conf 里多个不可达 nameserver 时，不会把请求的 10s 预算吃光。
+4. `/api/metrics` 增加 `dns_fallback` 计数；触发时 daemon 日志打印 `DNS 兜底: <host> -> <ip> via <server>`。
+
+### 真机验证（把系统 DNS 指向 192.0.2.1 后）
+```
+DNS 兜底: example.com -> 172.66.147.243 via 223.5.5.5:53 (系统解析失败: lookup example.com: i/o timeout)
+DNS 兜底: upos-sz-mirrorhw.bilivideo.com -> 39.136.229.78 via 223.5.5.5:53
+metrics: dns_fallback=2
+```
+视频 CDN 也通过兜底恢复，验证后已还原 `resolv.conf`。
+
+### 产物
+| 项 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,798,490 B | `a10c0cfd7a7b70acdfc5289de73ed416` |
+| 包内 `libs/arm/bili-daemon` | 6,422,663 B | `4f4c1dee3696e12fbc6d085552ff6894` |
+| 包内 `app.js` | 210,237 B | `7559f8439cbaabba99b5874a7142ff3c`（= v3.0.1 原样） |
+
+
 ## 3.0.1-netfix（2026-11-06）
 
 > 在 v3.0.1 原样基线上**只加网络稳定性修复**：前端文件与 v3.0.1 逐字节一致（`app.js 7559f843…`），版本号保持 3.0.1。

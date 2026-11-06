@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	qrcode "github.com/skip2/go-qrcode"
@@ -49,6 +50,66 @@ func newDownloadClient() *http.Client {
 
 func validBVID(bvid string) bool { return bvidRe.MatchString(bvid) }
 
+// ---- DNS 兜底 ----
+// 设备在校园网里常出现系统 DNS 不可用：日志实测 11 分钟内出现 191 次
+// "lookup api.bilibili.com on 192.168.1.1:53: no such host"，界面表现就是「无网络」。
+// 这里保留系统解析器为首选，失败后依次尝试公共 DNS，并缓存结果 10 分钟。
+var (
+	dnsCacheMu      sync.Mutex
+	dnsCache        = map[string]dnsCacheEntry{}
+	dnsFallbackHits int64
+	publicDNS       = []string{"223.5.5.5:53", "119.29.29.29:53", "8.8.8.8:53"}
+)
+
+type dnsCacheEntry struct {
+	ip     string
+	expire time.Time
+}
+
+func cacheDNS(host, ip string) {
+	dnsCacheMu.Lock()
+	dnsCache[host] = dnsCacheEntry{ip: ip, expire: time.Now().Add(10 * time.Minute)}
+	dnsCacheMu.Unlock()
+}
+
+func resolveIPv4(ctx context.Context, host string) (string, error) {
+	dnsCacheMu.Lock()
+	if e, ok := dnsCache[host]; ok && time.Now().Before(e.expire) {
+		ip := e.ip
+		dnsCacheMu.Unlock()
+		return ip, nil
+	}
+	dnsCacheMu.Unlock()
+
+	// 系统解析必须限时：resolv.conf 里可能有多个不可达的 nameserver，
+	// Go 会逐个重试，挂住时会把整个请求的 10s 预算吃掉，兜底根本来不及跑。
+	sysCtx, sysCancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	ips, sysErr := net.DefaultResolver.LookupIP(sysCtx, "ip4", host)
+	sysCancel()
+	if sysErr == nil && len(ips) > 0 {
+		ip := ips[0].String()
+		cacheDNS(host, ip)
+		return ip, nil
+	}
+	for _, server := range publicDNS {
+		d := &net.Dialer{Timeout: 2500 * time.Millisecond}
+		r := &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return d.DialContext(ctx, "udp4", server)
+		}}
+		cctx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+		ips2, err2 := r.LookupIP(cctx, "ip4", host)
+		cancel()
+		if err2 == nil && len(ips2) > 0 {
+			ip := ips2[0].String()
+			cacheDNS(host, ip)
+			atomic.AddInt64(&dnsFallbackHits, 1)
+			log.Printf("[BiliDaemon] DNS 兜底: %s -> %s via %s (系统解析失败: %v)", host, ip, server, sysErr)
+			return ip, nil
+		}
+	}
+	return "", fmt.Errorf("dns lookup %s failed: %v", host, sysErr)
+}
+
 func dialIPv4Context(ctx context.Context, network, addr string) (net.Conn, error) {
 	d := &net.Dialer{
 		Timeout:   8 * time.Second,
@@ -56,6 +117,11 @@ func dialIPv4Context(ctx context.Context, network, addr string) (net.Conn, error
 	}
 	switch network {
 	case "tcp", "tcp4":
+		if host, port, err := net.SplitHostPort(addr); err == nil && net.ParseIP(host) == nil {
+			if ip, rerr := resolveIPv4(ctx, host); rerr == nil {
+				return d.DialContext(ctx, "tcp4", net.JoinHostPort(ip, port))
+			}
+		}
 		return d.DialContext(ctx, "tcp4", addr)
 	case "udp", "udp4":
 		return d.DialContext(ctx, "udp4", addr)

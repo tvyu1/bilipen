@@ -412,6 +412,7 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 			"cache_fallbacks": atomic.LoadInt64(&cacheFallbacks),
 			"stream_stalls":   atomic.LoadInt64(&streamStalls),
 			"cache_hits":      atomic.LoadInt64(&cacheHits),
+			"dns_fallback":    atomic.LoadInt64(&dnsFallbackHits),
 		},
 	})
 }
