@@ -2,7 +2,37 @@
 
 网易有道词典笔 A7（型号 `Y09`）上的哔哩哔哩轻应用：Falcon 运行时（Vue2 + QuickJS）前端 + Go 守护进程 + 自研 native 视频解码模块。
 
-**当前版本：v3.0.1** · 版本说明见 [CHANGELOG.md](CHANGELOG.md)
+**当前版本：v3.0.2** · 版本说明见 [CHANGELOG.md](CHANGELOG.md) · 安装包见 [Releases](https://github.com/tvyu1/bilipen/releases)
+
+## 版本与发布（v3.0.2）
+
+**基线**：v3.0.2 = **v3.0.1 代码基线** + 界面去绿字 + 网络稳定性修复。中间 v3.0.3~v3.0.8 的实验性改动已整体回退（相关提交保留在 git 历史中，可单独取用）。
+
+**本版改动**
+
+| 类别 | 内容 |
+|---|---|
+| 界面 | 删除「我的」页绿色文字「已成功登录，解锁全清高码流」；详情页「已下载」按钮文字/描边由绿改灰（`#99a2aa`）、暗绿底改中性 `#23262b`；缓存页「离线播放」由绿改灰。全仓库无 `#00e676`。 |
+| 网络 | ① daemon 增加 **公共 DNS 兜底**（系统解析失败后依次走 `223.5.5.5` / `119.29.29.29` / `8.8.8.8`）并缓存解析结果 10 分钟；② 两级解析各限时 2.5s，避免不可达 nameserver 吃光请求预算；③ 三个 `http.Transport` 补 `MaxConnsPerHost`；④ 封面下载限 2 并发 + 同 bvid 去重；⑤ 启动时把 `RLIMIT_NOFILE` 抬到硬上限；⑥ WBI key 拉取失败退避 60s。 |
+| 可观测 | `/api/metrics` 新增 `goroutines` / `open_fds` / `cover_pending` / `dns_fallback`；触发兜底时 daemon 日志打印 `DNS 兜底: <host> -> <ip> via <server>`。 |
+
+**产物**
+
+| 文件 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,798,429 B | `abb21714d937a4a0dca36d8003a72122` |
+| `libs/arm/bili-daemon` | 6,422,663 B | `f0f9037dbd4180cbafe6fb3367622bd8` |
+| `app.js` | 210,091 B | `b4db58072bc12db03046d4606e11d1bc` |
+
+**真机验证（DNS 兜底）**：把设备 `/etc/resolv.conf` 指向不可达的 `192.0.2.1` 后，daemon 仍能解析并播放：
+
+```
+DNS 兜底: example.com -> 172.66.147.243 via 223.5.5.5:53 (系统解析失败: lookup example.com: i/o timeout)
+DNS 兜底: upos-sz-mirrorhw.bilivideo.com -> 39.136.229.78 via 223.5.5.5:53
+metrics: dns_fallback=2
+```
+
+> 说明：该兜底只作用于本应用；系统 DNS 故障时其它应用仍会受影响。
 
 ## 功能现状
 
@@ -57,7 +87,7 @@
 | 路径 | 说明 |
 |---|---|
 | `README.md` | 本说明（功能、结构、安装、使用、构建、限制、TODO） |
-| `CHANGELOG.md` | 版本演进历史（v2.4.0 ~ v3.0.1） |
+| `CHANGELOG.md` | 版本演进历史（v2.4.0 ~ v3.0.2） |
 | `frontend/app.js` | 前端 Vue2 + QuickJS 单文件源码（三栏骨架、2×2 网格与翻页、播放页双栏、音画同步控制器、进度条交互、原生输入法接入） |
 | `build_bili.py` | 打包脚本：交叉编译 Go daemon → 复制 `libs/arm/*.so` → 装配 `frontend/app.js` → 重算 manifest 证书 → 输出 `.amr` |
 | `bili_src/main.go` | 守护进程入口：路由注册、待机看门狗（屏幕状态感知）、CPU 采样、全局常量 |
@@ -68,6 +98,7 @@
 | `bili_src/volume.go` | 硬件音量联动：SysV 共享内存（Key `0x7663746c`）→ ALSA Control 23 |
 | `bili_src/history.go` | 本地观看历史（`/userdisk/bili_history.json`，60 条） |
 | `bili_src/download.go` | 离线下载：DASH 双流限速下载、`-c copy` 合并、磁盘空间监控 |
+| `bili_src/cache.go` | 在线缓存清单与清理（跳过正在播放/写入的文件） |
 | `bili_src/go.mod`、`go.sum` | Go 依赖（仅 `skip2/go-qrcode`） |
 | `native/rgavideo.c` | native 解码模块：FFmpeg 软解 + `sws_scale`/可选 RGA + 6 槽环形缓冲 + 锁外转换 + PTS 节奏/追帧 + 暂停恢复 + 裁剪/缩放模式 |
 | `libjsapi_rgavideo.so` | 预编译 native 模块（ARMv7 / uClibc，22KB），随仓库提供 |
@@ -88,6 +119,8 @@ adb shell "miniapp_cli install /userdisk/9002000869905604.amr"
 adb shell "killall bili-daemon miniapp 2>/dev/null; miniapp_cli start 9002000869905604"
 adb shell "curl -s http://127.0.0.1:18080/api/ping"   # 确认版本
 ```
+
+> 装低版本（降级）时 PMS 会拒绝同版本/降级安装，需先卸载：`miniapp_cli uninstall 9002000869905604` 再安装。安装后必须 `kill -9 <miniapp pid>` 重启宿主才会加载新前端。
 
 ## 使用
 
@@ -157,6 +190,8 @@ $TC/bin/arm-rockchip830-linux-uclibcgnueabihf-gcc -shared -fPIC -O2 \
 - 守护进程仅监听 `127.0.0.1:18080`，**未做鉴权**（依赖仅本机可访问）
 - **弹幕未实现**；**系统手势返回不支持**（平台限制，见上文）
 - 播放固定 letterbox「适应」模式（v3.0.1 移除了「铺满」切换）；非 16:9 视频按实际解码尺寸显示
+- 校园网/弱网下若**系统 DNS 整体不可用**，本应用靠公共 DNS 兜底继续工作，但其它应用仍会断网；可用 `/api/metrics` 的 `dns_fallback` 判断兜底是否生效
+- 播放页进入后的响应速度与音频连续性仍是已知痛点（v3.0.2 未改播放链路），排查方向记录在 [CHANGELOG.md](CHANGELOG.md)
 
 ## 免责声明
 
