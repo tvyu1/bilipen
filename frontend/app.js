@@ -4364,13 +4364,13 @@ var style_0 = { "_": {
     "color": "#99a2aa"
   },
   "detail-btn-dl-done": {
-    "backgroundColor": "#16382b",
+    "backgroundColor": "#23262b",
     "borderWidth": "1px",
     "borderStyle": "solid",
-    "borderColor": "#00e676"
+    "borderColor": "#99a2aa"
   },
   "detail-btn-text-done": {
-    "color": "#00e676"
+    "color": "#99a2aa"
   },
   "detail-btn-delete": {
     "backgroundColor": "#3a1d24",
@@ -4717,7 +4717,7 @@ var render = function () {
                 _c('text', { staticClass: ["video-card-owner"] }, [_vm._v(item.status === 'completed' ? _vm.formatBytes(item.total_bytes) : (item.status === 'downloading' ? (item.progress + '%') : '排队中'))]),
                 _c('text', {
                   staticClass: ["video-card-action"],
-                  style: { color: item.status === 'completed' ? '#00e676' : '#fb7299' }
+                  style: { color: item.status === 'completed' ? '#99a2aa' : '#fb7299' }
                 }, [_vm._v(item.status === 'completed' ? "离线播放" : "下载中")])
               ])
             ])
@@ -4780,7 +4780,6 @@ var render = function () {
             _c('div', { staticClass: ["login-info-box"] }, [
               _c('text', { staticClass: ["login-title"] }, [_vm._v("欢迎，" + _vm._s(_vm.user.uname))]),
               _c('text', { staticClass: ["login-tip"] }, [_vm._v("UID: " + _vm._s(_vm.user.mid))]),
-              _c('text', { staticClass: ["login-status"], style: { "color": "#00e676" } }, [_vm._v("已成功登录，解锁全清高码流")]),
               _c('div', {
                 staticClass: ["btn-action"],
                 style: { "backgroundColor": "#333742" },
