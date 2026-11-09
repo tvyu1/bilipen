@@ -1701,6 +1701,17 @@ var script = {
       this._lastAudioNow = 0;
       this._lastAudioNowAt = 0;
       this._startStreamPoll(gen, item.bvid);
+      // 预热已经开始、但用户抢在首个 onPosition 回调之前点了播放：此时音频其实已经在响。
+      // 旧逻辑会落到下面的 cold 分支，把音频整条重开（表现为「先响 1 秒，然后又加载」）。
+      // 这里先把它暂停并按预热位置处理，保证只在原位放行一次。
+      if (!this._audioParked && this._audioPrewarm && this.audioPlayer) {
+        const apos = this._audioPos || 0;
+        try { if (typeof this.audioPlayer.pause === 'function') this.audioPlayer.pause(); } catch (e) {}
+        this._audioParked = true;
+        this._audioParkAt = apos;
+        this._audioPrewarm = false;
+        console.warn('[Cover] prewarm -> park at ' + apos.toFixed(2) + 's');
+      }
       if (this._audioParked && this.audioPlayer) {
         // 音频已预热并停在 parkedAt：此刻同时放行音视频，内容 0 点完全对齐
         const parkedAt = this._audioParkAt || 0;
@@ -1782,16 +1793,16 @@ var script = {
           if (gen !== this.playGen || this.isStopping) return;
           this._retryBusy = false;
           this._lastSeekAt = 0;   // 绕过 seekTo 的 400ms 节流
-          this.seekTo(target);
+          this.seekTo(target, { auto: true });
         }, 400);
         return;
       }
       this._retryBusy = false;
-      this.playerErr = '播放中断，即将返回详情';
-      this._retryReturnTimer = this.$page.setTimeout(() => {
-        this._retryReturnTimer = null;
-        if (!this.isStopping) this.stop();
-      }, 2500);
+      // 旧逻辑 2.5s 后自动退回详情，用户只看到「加载失败」。改为停在错误页，
+      // 由用户点「重试」（retryNow 会用当前进度重新 seek）或「返回」。
+      this.playerErr = '加载失败，点「重试」继续';
+      this._setPlayerState('error');
+      console.warn('[Retry] give up, show retry button');
     },
     retryNow() {
       if (!this._playItem || this.isStopping) return;
@@ -3054,8 +3065,9 @@ var script = {
       this._showCtrlBar();
       this._handleProgressSeek(e);
     },
-    seekTo(targetSec) {
+    seekTo(targetSec, opts) {
       if (this.isStopping || !this.isPlaying) return;
+      const autoSeek = !!(opts && opts.auto);
       const item = this._playItem || this.detailItem();
       if (!item) return;
 
@@ -3103,7 +3115,8 @@ var script = {
       this.progress = this.vDuration > 0 ? (targetSec / this.vDuration) : 0;
       this._lastPos = targetSec;
       this._seekOffset = targetSec;
-      this.statusText = '跳转中 ' + this.fmtTime(targetSec) + '...';
+      // 自动重试/兜底起播是「加载」而不是用户主动跳转，状态栏不要谎报「跳转中 X 秒」。
+      this.statusText = autoSeek ? '加载中…' : ('跳转中 ' + this.fmtTime(targetSec) + '...');
 
       // 彻底停止上一路音视频
       this._stopAudioOnly();
