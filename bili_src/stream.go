@@ -543,17 +543,40 @@ func copySpoolStream(w io.Writer, ctx context.Context, s *spool, startOffset, le
 			} else if serr != nil {
 				return
 			} else {
-				if !s.waitFor(curPos+toRead, 2*time.Second) {
+				// 弱网下 spool 的下载速度可能略低于播放消耗，读空是常态而非「流结束」。
+				// 旧实现只等 2s 就 return，前端把它当成 eof-mid → 重试 → 越试越糟（实测 200KB/s 下必现）。
+				// 现在改为「读空就继续等」，只有下载完成 / 出错 / 客户端断开 / 长时间（90s）无进展才结束。
+				starvedSince := time.Now()
+				for {
+					if ctx.Err() != nil {
+						return
+					}
+					if s.waitFor(curPos+toRead, 2*time.Second) {
+						break
+					}
 					s.mu.Lock()
 					have = s.have
 					done = s.done
+					serr = s.err
 					s.mu.Unlock()
-					if curPos >= have && done {
+					if curPos < have || done || serr != nil {
+						break
+					}
+					if time.Since(starvedSince) > 90*time.Second {
+						log.Printf("[BiliDaemon] spool %s starved 90s at %d/%d, abort stream", s.bvid, curPos, have)
 						return
 					}
-					if curPos >= have {
+				}
+				if serr != nil {
+					return
+				}
+				if curPos >= have {
+					if done {
 						return
 					}
+					continue
+				}
+				if have-curPos < toRead {
 					toRead = have - curPos
 				}
 			}
