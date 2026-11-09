@@ -1661,6 +1661,8 @@ var script = {
         this._stopStreamPoll();
         this._setPlayerState('ready-paused');
         this.ctrlVisible = false;
+        // 视频首帧已就绪，但音频还在预热：继续显示「加载中…」，等音频也停稳后再放开提示。
+        this.statusText = '加载中…';
         console.warn('[Cover] held at ' + (this._seekOffset || 0) + 's primed=' + inf.primed);
         // 封面期就把音频链路预热到「已出声但被暂停」，点播放时音视频同帧开始，
         // 不必再等厂商播放器 3~4s 的启动（旧逻辑会先响几秒声音，视频才开始追）。
@@ -1890,7 +1892,7 @@ var script = {
       // 所以有权威值时不让 native 覆盖，否则进度条右侧总时长会永远停在那个错值上。
       this._durFromDetail = dsec > 0 ? dsec : 0;
       this.vDuration = this._durFromDetail;
-      this.statusText = '准备播放...';
+      this.statusText = '加载中…';
       this.isPlaying = true;
       this.isStopping = false;
       // 默认暂停：先解首帧当封面，等用户点播放再起音频、走时间轴。
@@ -2090,10 +2092,14 @@ var script = {
           if (this.playerState === 'playing' && !this.isPaused && this._syncDone) {
             if (advanced) {
               this._bufLastAt = now;
-              if (this.buffering) this.buffering = false;
+              if (this.buffering) {
+                this.buffering = false;
+                if (this.statusText === '加载中…') this.statusText = '';
+              }
             } else if (this._bufLastAt && now - this._bufLastAt > 900) {
               if (!this.buffering) {
                 this.buffering = true;
+                this.statusText = '加载中…';
                 this._startStreamPoll(gen, this.currentBvid);
               }
             }
@@ -2409,6 +2415,8 @@ var script = {
                 this._audioParkAt = a;
                 this._audioCbAt = Date.now();   // 暂停期间不再刷新回调心跳，避免误报「音频冻结」
                 try { if (typeof ap.pause === 'function') ap.pause(); } catch (e) {}
+                // 音频也停稳了：此刻音视频都就绪，可以点 ▶ 同帧起播
+                this.statusText = '';
                 console.warn('[Cover] audio parked at ' + a.toFixed(2) + 's');
               } else {
                 // pause 没拦住（仍在回调）：持续跟随最新位置，保证放行时仍然对齐
@@ -2759,7 +2767,7 @@ var script = {
       this._probeLogged = false;
       console.warn("[SoftVPlayer] play#" + gen + " " + item.bvid + " mode=" + (this.audioMode ? 'audio' : 'video') + " out=" + out.w + "x" + out.h + " src=" + src.w + "x" + src.h);
 
-      this.statusText = '准备播放: ' + (item.title ? item.title.slice(0, 10) : '') + '...';
+      this.statusText = '加载中…';
       this.isPlaying = true;
       this._startKeepScreen();
       if (prevPlayer) {
