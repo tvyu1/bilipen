@@ -2,7 +2,7 @@
 
 网易有道词典笔 A7（型号 `Y09`）上的哔哩哔哩轻应用：Falcon 运行时（Vue2 + QuickJS）前端 + Go 守护进程 + 自研 native 视频解码模块。
 
-**当前版本：v3.0.3** · 版本说明见 [CHANGELOG.md](CHANGELOG.md) · 安装包见 [Releases](https://github.com/tvyu1/bilipen/releases)
+**当前版本：v3.0.7**（优化弱网体验）· 版本说明见 [CHANGELOG.md](CHANGELOG.md) · 安装包见 [Releases](https://github.com/tvyu1/bilipen/releases)
 
 ## 版本与发布（v3.0.3）
 
