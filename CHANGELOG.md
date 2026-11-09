@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## 3.0.3（2026-11-09）
+
+> 修「弱网下首页推荐能播，历史/搜索里的视频播不了」。日志定位到失败全部发生在**带 `ss` 的定位起播**路径（历史续播、手动 ±10），而非首页从 0 起播。
+
+### 证据（2026-11-09 上午 11:04–11:12）
+- `[Retry] abnormal why=prime-timeout at=107s pos=107.9/…` → `[Seek] seekTo 107s` → `[Seek] rgav started …/api/stream` → `[Retry] abnormal why=eof-mid at=21…`
+- 同一模式在 BV1Qx411F7Wc / BV1c6WH6fEoH / BV143LNzLEsR 上重复出现；首页从 0 起播的会话无此问题。
+- 根因：daemon 的定位切片用 `ffmpeg -ss <ss> -i <远端 URL> -c:v copy` 直接对 CDN 做输入定位，弱网下首包 >6s，前端 6s 判 `prime-timeout` 后重试同一位置；ffmpeg 连接被掐断后流提前结束（`eof-mid`），形成「起播→重试→再失败」循环。
+
+### 修复
+1. **daemon**：远端定位切片加 `-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -rw_timeout 15000000`，瞬时断链由 ffmpeg 自愈，不再一次抖动就整段 EOF。
+2. **前端**：首帧等待由 6s 放宽到 15s（`prime-timeout` / `cover-timeout`），避免弱网首包慢时被误判。
+3. **前端**：异常重试改为最多 2 次——第 1 次原地重试；第 2 次若原本在 >10s 位置，则**兜底从 0 秒起播**（spool 顺序路径，弱网下通常仍能出画面），而不是直接退回详情页。
+
+### 产物
+| 项 | 大小 | md5 |
+|---|---|---|
+| `9002000869905604.amr` | 2,798,972 B | `（见下一步构建输出）` |
+| 包内 `libs/arm/bili-daemon` | 6,422,663 B | `de2b411904be6f702c3d25082bb58ad9` |
+| 包内 `app.js` | 210,725 B | `b9ab19a55a9903349fd646a96b267af8` |
+
+
 ## 3.0.2（2026-11-06）
 
 > 基于 v3.0.1 基线的发布：去掉界面上所有绿色文字；网络修复沿用 3.0.1-dnsfix（公共 DNS 兜底 + 连接池上限 + 封面限流 + fd 上限）。

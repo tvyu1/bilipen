@@ -874,6 +874,12 @@ func handleSeekVideoStream(w http.ResponseWriter, r *http.Request, bvid, srcPath
 		args = []string{
 			"-y",
 			"-headers", fmt.Sprintf("User-Agent: %s\r\nReferer: %s\r\n", UserAgent, BiliReferer),
+			// 弱网下远端 -ss 定位常常首包很慢，连接一断 ffmpeg 直接 EOF（前端表现为 eof-mid）。
+			// 这里让 ffmpeg 自己重连并给 I/O 一个上限，至少不会一次抖动就整段失败。
+			"-reconnect", "1",
+			"-reconnect_streamed", "1",
+			"-reconnect_delay_max", "5",
+			"-rw_timeout", "15000000",
 			"-ss", ss,
 			"-i", srcPath,
 			"-c:v", "copy",

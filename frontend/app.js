@@ -1633,7 +1633,8 @@ var script = {
       if (!inf) return;
       if (inf.finished) { this._handleAbnormalEnd(gen, inf, 'cover-eof'); return; }
       if (this._coverPhase === 'wait-prime') {
-        if (now - (this._coverAt || now) > 6000) { this._handleAbnormalEnd(gen, inf, 'prime-timeout'); return; }
+        // 弱网下远端定位起播首包常超过 6s，过早判超时会导致「刚起播就重试/退回详情」。
+        if (now - (this._coverAt || now) > 15000) { this._handleAbnormalEnd(gen, inf, 'prime-timeout'); return; }
         if (!inf.primed) return;
         try { this.rgav.resume(0); } catch (e) {}
         this._coverPhase = 'acquire';
@@ -1643,7 +1644,7 @@ var script = {
         let got = 0;
         try { got = this.rgav.readFrame(); } catch (e) {}
         if (!got) {
-          if (now - (this._coverAt || now) > 6000) this._handleAbnormalEnd(gen, inf, 'cover-timeout');
+          if (now - (this._coverAt || now) > 15000) this._handleAbnormalEnd(gen, inf, 'cover-timeout');
           return;
         }
         try { ctx.putImageData(this.imageData, 0, 0); } catch (e) {}
@@ -1767,15 +1768,21 @@ var script = {
       console.warn('[Retry] abnormal why=' + why + ' at=' + at + 's pos=' + abs.toFixed(1) + '/' + dur +
         ' err=' + (this._lastRgavErr || ''));
 
-      if ((this._autoRetry || 0) < 1) {
-        this._autoRetry = 1;
+      if ((this._autoRetry || 0) < 2) {
+        const attempt = this._autoRetry || 0;
+        this._autoRetry = attempt + 1;
+        // 第一次：原地重试；第二次（且原本在非 0 位置）：兜底回到 0 秒，
+        // 走 spool 顺序路径——弱网下远端定位起播失败时，这条路通常还能出画面。
+        const fallbackZero = attempt === 1 && at > 10;
+        const target = fallbackZero ? 0 : at;
         this.playerErr = '播放中断，正在重试…';
+        console.warn('[Retry] attempt=' + (attempt + 1) + ' target=' + target + 's' + (fallbackZero ? ' (fallback 0)' : ''));
         this._retryTimer = this.$page.setTimeout(() => {
           this._retryTimer = null;
           if (gen !== this.playGen || this.isStopping) return;
           this._retryBusy = false;
           this._lastSeekAt = 0;   // 绕过 seekTo 的 400ms 节流
-          this.seekTo(at);
+          this.seekTo(target);
         }, 400);
         return;
       }
