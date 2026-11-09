@@ -2,7 +2,11 @@
 
 网易有道词典笔 A7（型号 `Y09`）上的哔哩哔哩轻应用：Falcon 运行时（Vue2 + QuickJS）前端 + Go 守护进程 + 自研 native 视频解码模块。
 
-**当前版本：v3.0.2** · 版本说明见 [CHANGELOG.md](CHANGELOG.md) · 安装包见 [Releases](https://github.com/tvyu1/bilipen/releases)
+**当前版本：v3.0.3** · 版本说明见 [CHANGELOG.md](CHANGELOG.md) · 安装包见 [Releases](https://github.com/tvyu1/bilipen/releases)
+
+## 版本与发布（v3.0.3）
+
+**v3.0.3（2026-11-09）**：修「弱网下首页推荐能播、历史/搜索里的视频播不了」。日志显示失败全部落在**带 `ss` 的定位起播**（历史续播、手动 ±10）：daemon 用 `ffmpeg -ss <ss> -i <远端 URL> -c:v copy` 直接对 CDN 输入定位，弱网首包 >6s 触发 `prime-timeout`，重试同一位置后 ffmpeg 连接被掐断导致 `eof-mid`。修复：① daemon 远端切片加 `-reconnect/-rw_timeout`；② 首帧等待 6s → 15s；③ 二次失败时兜底从 0 秒起播（spool 路径）。产物：`9002000869905604.amr` 2,798,971 B / `1819fb45…`。
 
 ## 版本与发布（v3.0.2）
 
