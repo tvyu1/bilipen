@@ -2447,6 +2447,23 @@ var script = {
           const audioUrl = 'http://127.0.0.1:18080/api/audio?bvid=' + item.bvid + '&variant=remux' + (this._seekOffset ? ('&ss=' + this._seekOffset) : '');
           ap.start(audioUrl);
           console.warn('[Rga] audio started: ' + audioUrl + ', pause=' + (typeof ap.pause));
+          // 预热阶段静音：厂商播放器没有音量接口，只能「开播后立刻暂停」。
+          // onPosition 是整数秒回调，要 ~1s 才来；等它再停会让用户没点播放先听到约 1 秒声音，
+          // 所以这里 200ms 就先暂停一次（回调兜底逻辑仍保留，防止 pause 太早没生效）。
+          if (this.coverHold && this._audioPrewarm && !this._audioParked) {
+            this.$page.setTimeout(() => {
+              if (!this.coverHold || !this._audioPrewarm || this._audioParked) return;
+              try {
+                if (typeof ap.pause === 'function') ap.pause();
+                this._audioParked = true;
+                this._audioParkAt = 0;
+                this._audioPrewarm = false;
+                this._audioCbAt = Date.now();
+                this.statusText = '';   // 音视频都已就绪
+                console.warn('[Cover] audio parked early at 0.00s');
+              } catch (e) {}
+            }, 200);
+          }
         } catch (e) {
           console.warn('[Rga] audio init error: ' + e);
         }
@@ -3048,8 +3065,8 @@ var script = {
       if (x === null || y === null) return null;
       return { x: x, y: y };
     },
-    // 进度条只支持「点击跳转」，已移除拖动 seek（设备触摸事件不稳，容易误触发连续重开解码）
-    _handleProgressSeek(e) {
+    // 进度条只做展示：点击跳转已移除，跳转只保留 -10/+10 两个按钮。
+    _removedProgressSeek(e) {
       if (!this.isPlaying || !this.vDuration || this.vDuration <= 0) return;
       if (this.playerState === 'loading' || this.playerState === 'seeking' || this.playerState === 'error') return;
       // 与 ctrl-bar 固定布局一致：4(padding)+30+2+24+2 = 62；轨道宽 150。
@@ -3068,11 +3085,7 @@ var script = {
       console.warn('[Seek] progress tap: pct=' + pct.toFixed(3) + ' targetSec=' + targetSec + ' / ' + this.vDuration);
       this.seekTo(targetSec);
     },
-    onProgressClick(e) {
-      if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
-      this._showCtrlBar();
-      this._handleProgressSeek(e);
-    },
+
     seekTo(targetSec, opts) {
       if (this.isStopping || !this.isPlaying) return;
       const autoSeek = !!(opts && opts.auto);
@@ -4948,11 +4961,9 @@ var render = function () {
         _c('div', { staticClass: ["ctrl-btn", "ctrl-btn-sm"], on: { "click": function () { _vm.seekRelative(-10); } } }, [
           _c('text', { staticClass: ["ctrl-btn-text"] }, [_vm._v("-10")])
         ]),
+        // 进度条只做展示（点击快进已移除，跳转只保留 -10/+10）
         _c('div', {
-          staticClass: ["ctrl-track"],
-          on: {
-            "click": function ($event) { _vm.onProgressClick($event); }
-          }
+          staticClass: ["ctrl-track"]
         }, [
           _c('div', { staticClass: ["ctrl-buf"], style: { width: (_vm.streamPct >= 0 ? _vm.streamPct : 0) + '%' } }),
           _c('div', { staticClass: ["ctrl-fill"], style: { width: Math.round((_vm.progress || 0) * 100) + '%' } })
