@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -105,6 +106,131 @@ func handleALSAReady(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// ---- 音频本地缓存（预热）----
+// 目的：厂商播放器起播要等网络首包（弱网 1~3s），而它没有「只缓存不播」的接口。
+// 这里让 daemon 在点「看视频」时后台把重封装后的音轨落盘；真正起播时从本地文件跟随读取，
+// 首个字节从秒级降到几十毫秒，音视频就能几乎同时开始。
+var (
+	audioPrefMu      sync.Mutex
+	audioPrefetching = map[string]bool{}
+)
+
+func audioCachePath(bvid string) string {
+	return filepath.Join(CacheDir, bvid+".audio.mp4")
+}
+
+func audioPrefetchActive(bvid string) bool {
+	audioPrefMu.Lock()
+	defer audioPrefMu.Unlock()
+	return audioPrefetching[bvid]
+}
+
+func prefetchAudio(bvid string) {
+	audioPrefMu.Lock()
+	if audioPrefetching[bvid] {
+		audioPrefMu.Unlock()
+		return
+	}
+	audioPrefetching[bvid] = true
+	audioPrefMu.Unlock()
+	defer func() {
+		audioPrefMu.Lock()
+		delete(audioPrefetching, bvid)
+		audioPrefMu.Unlock()
+	}()
+
+	final := audioCachePath(bvid)
+	if fi, err := os.Stat(final); err == nil && fi.Size() > 512*1024 {
+		return
+	}
+	if _, err := os.Stat(FFmpegPath); err != nil {
+		return
+	}
+	au, err := resolveAudio(bvid)
+	if err != nil {
+		log.Printf("[BiliDaemon] audio prefetch resolve failed for %s: %v", bvid, err)
+		return
+	}
+	_ = os.MkdirAll(CacheDir, 0755)
+	args := []string{"-y", "-hide_banner", "-loglevel", "error", "-nostdin",
+		"-user_agent", UserAgent, "-referer", BiliReferer}
+	if c := loadCookie(); c != "" {
+		args = append(args, "-headers", "Cookie: "+c+"\r\n")
+	}
+	args = append(args,
+		"-probesize", "131072", "-analyzeduration", "131072",
+		"-i", au.url,
+		"-f", "lavfi", "-i", "color=c=black:s=160x90:r=1",
+		"-map", "0:a:0", "-map", "1:v:0",
+		"-c:a", "copy",
+		"-c:v", "mpeg4", "-q:v", "31", "-g", "1",
+		"-shortest",
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4", final,
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+	defer cancel()
+	cmd := execFFmpegCommand(ctx, args)
+	if err := cmd.Run(); err != nil {
+		_ = os.Remove(final)
+		log.Printf("[BiliDaemon] audio prefetch %s failed: %v", bvid, err)
+		return
+	}
+	if fi, err := os.Stat(final); err == nil {
+		log.Printf("[BiliDaemon] audio prefetched %s (%d bytes)", bvid, fi.Size())
+	}
+}
+
+// serveAudioCache 从「可能仍在增长」的缓存文件里跟随读取：prefetch 没下完时读到末尾就等，
+// prefetch 结束后自然收尾。分片 mp4（empty_moov）可以边下边播。
+func serveAudioCache(w http.ResponseWriter, r *http.Request, bvid, path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		http.Error(w, "audio cache open: "+err.Error(), 500)
+		return
+	}
+	defer f.Close()
+	w.Header().Set("Content-Type", "video/mp4")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	if flusher != nil {
+		flusher.Flush()
+	}
+	ctx := r.Context()
+	buf := make([]byte, 64*1024)
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		n, rerr := f.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			atomic.AddInt64(&audioBytes, int64(n))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if rerr == io.EOF {
+			if !audioPrefetchActive(bvid) {
+				log.Printf("[BiliDaemon] audio cache stream end %s", bvid)
+				return
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(120 * time.Millisecond):
+			}
+			continue
+		}
+		if rerr != nil {
+			return
+		}
+	}
+}
+
 // handleAudio provides remuxed or raw audio stream, with seek support (&ss=).
 func handleAudio(w http.ResponseWriter, r *http.Request) {
 	bvid := r.URL.Query().Get("bvid")
@@ -127,6 +253,18 @@ func handleAudio(w http.ResponseWriter, r *http.Request) {
 	if fileExists(cachePath) {
 		handleLocalAudioRemux(w, r, bvid, cachePath, ss)
 		return
+	}
+
+	// 2.5 音频本地缓存（prefetch 落盘）：起播走本地，seek 仍走本地文件 remux
+	if ap := audioCachePath(bvid); fileExists(ap) || audioPrefetchActive(bvid) {
+		if ss == "" || ss == "0" {
+			serveAudioCache(w, r, bvid, ap)
+			return
+		}
+		if fileExists(ap) {
+			handleLocalAudioRemux(w, r, bvid, ap, ss)
+			return
+		}
 	}
 
 	// 3. Resolve upstream audio

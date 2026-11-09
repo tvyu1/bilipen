@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	Version     = "3.0.7"
+	Version     = "3.0.8"
 	Port        = 18080
 	UserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 	BiliReferer = "https://www.bilibili.com/"
@@ -181,6 +181,8 @@ func handlePlay(w http.ResponseWriter, r *http.Request) {
 	if !wasOn {
 		initHardwareAudio()
 	}
+	// 后台把音轨落到本地缓存：点播放时音频从本地起，缩短到与视频几乎同时
+	go prefetchAudio(bvid)
 	log.Printf("[BiliDaemon] playback session start: %s mode=%s (%s)", bvid, mode, title)
 
 	w.Header().Set("Content-Type", "application/json")

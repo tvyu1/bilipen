@@ -1664,9 +1664,10 @@ var script = {
         // 视频首帧已就绪，但音频还在预热：继续显示「加载中…」，等音频也停稳后再放开提示。
         this.statusText = '加载中…';
         console.warn('[Cover] held at ' + (this._seekOffset || 0) + 's primed=' + inf.primed);
-        // 封面期就把音频链路预热到「已出声但被暂停」，点播放时音视频同帧开始，
-        // 不必再等厂商播放器 3~4s 的启动（旧逻辑会先响几秒声音，视频才开始追）。
-        this._prewarmAudio(gen);
+        // 不再预热音频：厂商播放器没有「只缓存不播」的接口，预热必然先出声（用户没点播放就能听到）。
+        // 改为点 ▶ 时才冷启音频（见 resumeFromCover 的 cold 分支）：视频停在封面帧，
+        // 等音频真正走起来（首个 ≥0.3s 的位置回调）后再一起放。
+        this._audioPrewarm = false;
       }
     },
     _prewarmAudio(gen) {
@@ -1725,6 +1726,7 @@ var script = {
         console.warn('[Cover] resume both at ' + parkedAt.toFixed(2) + 's');
       } else {
         this._audioPrewarm = false;
+        this.statusText = '加载中…';   // 等音频真正走起来再一起放
         this._startAudioGate(gen, item);
         console.warn('[Cover] resume -> start audio (cold)');
       }
@@ -2447,23 +2449,7 @@ var script = {
           const audioUrl = 'http://127.0.0.1:18080/api/audio?bvid=' + item.bvid + '&variant=remux' + (this._seekOffset ? ('&ss=' + this._seekOffset) : '');
           ap.start(audioUrl);
           console.warn('[Rga] audio started: ' + audioUrl + ', pause=' + (typeof ap.pause));
-          // 预热阶段静音：厂商播放器没有音量接口，只能「开播后立刻暂停」。
-          // onPosition 是整数秒回调，要 ~1s 才来；等它再停会让用户没点播放先听到约 1 秒声音，
-          // 所以这里 200ms 就先暂停一次（回调兜底逻辑仍保留，防止 pause 太早没生效）。
-          if (this.coverHold && this._audioPrewarm && !this._audioParked) {
-            this.$page.setTimeout(() => {
-              if (!this.coverHold || !this._audioPrewarm || this._audioParked) return;
-              try {
-                if (typeof ap.pause === 'function') ap.pause();
-                this._audioParked = true;
-                this._audioParkAt = 0;
-                this._audioPrewarm = false;
-                this._audioCbAt = Date.now();
-                this.statusText = '';   // 音视频都已就绪
-                console.warn('[Cover] audio parked early at 0.00s');
-              } catch (e) {}
-            }, 200);
-          }
+
         } catch (e) {
           console.warn('[Rga] audio init error: ' + e);
         }
@@ -2560,6 +2546,7 @@ var script = {
       // 封面暂停期间不允许放行视频（预热音频的兜底定时器可能在这时到点）
       if (this.coverHold && !this._coverResumed) return;
       this._syncDone = true;
+      if (this.statusText === '加载中…') this.statusText = '';
       try {
         if (this._syncTimer) { this.$page.clearTimeout(this._syncTimer); this._syncTimer = null; }
         if (this._infoResumeTimer) { this.$page.clearTimeout(this._infoResumeTimer); this._infoResumeTimer = null; }
