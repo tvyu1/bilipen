@@ -21,6 +21,7 @@ scratch/app_check.mjs
 
 # ---- 杂项 ----
 *.log
+.tmp_*
 __pycache__/
 *.pyc
 .vscode/

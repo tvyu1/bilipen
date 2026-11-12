@@ -18,6 +18,25 @@ var __env = (typeof $falcon !== 'undefined' && $falcon && $falcon.env) ? $falcon
 var DEV_W = Number(__env && __env.deviceWidth) || 640;
 var DEV_H = Number(__env && __env.deviceHeight) || 172;
 if (DEV_W < DEV_H) { var __swap = DEV_W; DEV_W = DEV_H; DEV_H = __swap; }
+function __vw(px) { return Math.round(px * DEV_W / 640) + 'px'; }
+function __vh(px) { return Math.round(px * DEV_H / 172) + 'px'; }
+// 样式表用 vw/vh 编写，但直接交给渲染会让所有长度变成小数 -> 文字落点落在亚像素上，
+// 实测发虚、锯齿变多。启动时统一折算成整数 px（A7 上折回原值，A7P 上同样是整数落点）。
+function __adaptStyleTree(o) {
+  if (!o || typeof o !== 'object') return;
+  for (var k in o) {
+    var val = o[k];
+    if (typeof val === 'string') {
+      var m = /^(-?\d+(?:\.\d+)?)(vw|vh)$/.exec(val);
+      if (m) {
+        var n = parseFloat(m[1]);
+        o[k] = (m[2] === 'vw' ? Math.round(n * DEV_W / 100) : Math.round(n * DEV_H / 100)) + 'px';
+      }
+    } else if (val && typeof val === 'object') {
+      __adaptStyleTree(val);
+    }
+  }
+}
 
 function safeJson(body, fallback) {
   if (body === null || body === undefined || body === '') return fallback;
@@ -111,6 +130,7 @@ class App extends $falcon.App {
   onLaunch(options) {
     super.onLaunch(options);
     this.setViewPort(DEV_W);
+    __adaptStyleTree(style_0);
     console.warn('[Adapt] screen ' + DEV_W + 'x' + DEV_H + ' vw/vh layout');
     $falcon.useDefaultBasePageClass(BasePage);
   }
@@ -4719,13 +4739,13 @@ var render = function () {
         // legacy: 历史卡片已并入统一网格
         (false && _vm.currentTab === 'history') ? (_vm.history.length > 0 ? _c('scroller', {
           staticClass: ["card-scroller"],
-          style: { "height": "84.883721vh" },
+          style: { "height": __vh(146) },
           attrs: { "scrollDirection": "horizontal" }
         }, _vm._l(_vm.history, function (item, index) {
           return _c('div', {
             key: item.bvid,
             staticClass: ["video-card"],
-            style: { "height": "80.232558vh" },
+            style: { "height": __vh(138) },
             on: { "click": function ($event) { _vm.openDetail({ bvid: item.bvid, title: item.title, pic: item.pic }); } }
           }, [
             _c('image', {
@@ -4748,13 +4768,13 @@ var render = function () {
         // legacy: 缓存卡片已并入统一网格
         (false && _vm.currentTab === 'download') ? (_vm.downloads.length > 0 ? _c('scroller', {
           staticClass: ["card-scroller"],
-          style: { "height": "84.883721vh" },
+          style: { "height": __vh(146) },
           attrs: { "scrollDirection": "horizontal" }
         }, _vm._l(_vm.downloads, function (item, index) {
           return _c('div', {
             key: item.bvid,
             staticClass: ["video-card"],
-            style: { "height": "80.232558vh" },
+            style: { "height": __vh(138) },
             on: { "click": function ($event) { _vm.openDetail({ bvid: item.bvid, title: item.title, pic: item.pic, pic_local: item.pic_local }); } }
           }, [
             _c('image', {
@@ -4780,13 +4800,13 @@ var render = function () {
         // legacy: 搜索结果已并入统一网格
         (false && _vm.currentTab === 'search') ? _c('scroller', {
           staticClass: ["card-scroller"],
-          style: { "height": "84.883721vh" },
+          style: { "height": __vh(146) },
           attrs: { "scrollDirection": "horizontal" }
         }, _vm._l(_vm.searchResults, function (item, index) {
           return _c('div', {
             key: item.bvid,
             staticClass: ["video-card"],
-            style: { "height": "80.232558vh" },
+            style: { "height": __vh(138) },
             on: { "click": function ($event) { _vm.openDetail(item); } }
           }, [
             _c('image', {
@@ -4810,7 +4830,7 @@ var render = function () {
               staticClass: ["qr-image"],
               attrs: { "src": _vm.loginQrPath }
             }) : _c('div', { staticClass: ["qr-image"], style: { "justifyContent": "center", "alignItems": "center" } }, [
-              _c('text', { style: { "color": "#666", "fontSize": "6.395349vh" } }, [_vm._v("生成中...")])
+              _c('text', { style: { "color": "#666", "fontSize": __vh(11) } }, [_vm._v("生成中...")])
             ]),
             _c('div', { staticClass: ["login-info-box"] }, [
               _c('text', { staticClass: ["login-title"] }, [_vm._v("哔哩哔哩扫码登录")]),
@@ -5046,7 +5066,7 @@ var render = function () {
           _c('div', { staticClass: ["chip-row"] }, [
             _c('div', { staticClass: ["chip"], class: [_vm.commentSort === 'hot' ? 'chip-on' : ''], on: { "click": function () { _vm.setCommentSort('hot'); } } }, [_c('text', { staticClass: ["chip-text"] }, [_vm._v("最热")])]),
             _c('div', { staticClass: ["chip"], class: [_vm.commentSort === 'new' ? 'chip-on' : ''], on: { "click": function () { _vm.setCommentSort('new'); } } }, [_c('text', { staticClass: ["chip-text"] }, [_vm._v("最新")])]),
-            _c('text', { staticClass: ["side-sub"], style: { marginLeft: "0.9375vw" } }, [_vm._v(_vm._s(_vm.commentCount) + " 条")]),
+            _c('text', { staticClass: ["side-sub"], style: { marginLeft: __vw(6) } }, [_vm._v(_vm._s(_vm.commentCount) + " 条")]),
             _c('div', { staticClass: ["chip", "chip-nav"], on: { "click": function () { _vm.commentPrevPage(); } } }, [_c('text', { staticClass: ["chip-nav-text"] }, [_vm._v("‹")])]),
             _c('div', { staticClass: ["chip", "chip-nav"], on: { "click": function () { _vm.commentNextPage(); } } }, [_c('text', { staticClass: ["chip-nav-text"] }, [_vm._v("›")])])
           ]),
