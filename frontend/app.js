@@ -1147,7 +1147,7 @@ var script = {
       }
       const next = !this.isPaused;
       this.isPaused = next;
-      this._audioSyncingPaused = false;
+      this._videoBraking = false;
       if (next) {
         // 暂停：视频解码线程原地等待 + 音频设备暂停，两边内容时间都不再推进。
         try { if (this.rgav && typeof this.rgav.pause === 'function') this.rgav.pause(); } catch (e) {}
@@ -1974,7 +1974,7 @@ var script = {
       this._audioPrewarm = false;
       this._audioParked = false;
       this._audioParkAt = 0;
-      this._audioSyncingPaused = false;
+      this._videoBraking = false;
       this._startedAt = Date.now();
       this._lastAudioNow = 0;
       this._lastAudioNowAt = 0;
@@ -2125,7 +2125,7 @@ var script = {
                 this.buffering = false;
                 if (this.statusText === '加载中…') this.statusText = '';
               }
-            } else if (this._bufLastAt && now - this._bufLastAt > 900) {
+            } else if (this._bufLastAt && !this._videoBraking && now - this._bufLastAt > 900) {
               if (!this.buffering) {
                 this.buffering = true;
                 this.statusText = '加载中…';
@@ -2196,6 +2196,7 @@ var script = {
             }
 
             // 当视频与音频均在正常播放中时计算实时时钟偏差
+            // 当视频与音频均在正常播放中时计算实时时钟偏差
             if (this._syncDone && this._audioPos > 0 && this._audioPosAt > 0 && info.position > 1.0) {
               const audioElapsed = (now - this._audioPosAt) / 1000;
               // 追踪实际音频物理位置是否在推进，检测弱网断流卡顿
@@ -2205,102 +2206,92 @@ var script = {
               }
               const audioElapsedSinceMove = now - (this._lastTrackedAudioMovedAt || now);
               const audioStalled = audioElapsedSinceMove > 2000;
+              // audioNow 是「绝对内容时间」（_audioPos 已含 _seekOffset），
+              // info.position 是 native 本次流的相对位置，必须补回偏移再比。
+              const audioNow = this._audioClockNow();
+              const videoNow = (this._seekOffset || 0) + info.position;
+              const rawDrift = audioNow - videoNow; // >0 视频落后；<0 视频超前
+              const audioFresh = this._audioCbAt && (now - this._audioCbAt) < 2000;
+              const videoMoving = !this._bufLastAt || (now - this._bufLastAt) < 1200;
 
-              // 仅当音频进度在正常更新周期内且音频未卡死断流时，才进行动态微调
-              if (audioElapsed < 2.5 && !audioStalled) {
-                // 用斜率回归时钟代替「整数位置 + 墙钟外推」：后者的等效速率只有 ~92.6%，
-                // 会把口径误差当成真实失步，导致闭环持续误判视频领先。
-                const audioNow = this._audioClockNow();
-                // 关键：audioNow 是「绝对内容时间」（_audioPos 已加过 _seekOffset），
-                // 而 info.position 是 native 本次流的相对位置（seek 后从 0 开始）。
-                // 两者直接相减会把 seek 偏移量当成永久失步（实测 seek 10s 后
-                // pos=32.9/apos=37.0 实际只差 4.1s，却报 14.66s），进而每 300ms
-                // 触发一次 fast catch-up 疯狂跳帧。这里必须补回偏移。
-                const videoNow = (this._seekOffset || 0) + info.position;
-                const rawDrift = audioNow - videoNow; // >0 视频落后需跳帧；<0 视频超前需等待
-
-                // 大偏差处理：只要 |drift| > 1s 就累计 strike，连续 3 次即做一次硬重同步。
-                // 旧实现在 >2s 时「清空滤波什么都不做」，结果视频卡顿 2.9s 后音频跑前 5s，
-                // 偏差永远回不来（日志里 apos−pos 稳定在 5.0s 就是这个原因）。
-                // 硬重同步的前置门（关键）：
-                //  1) 起播/seek 后 6s 内音频还在爬坡，此时的巨大偏差是假象，绝不能 seek；
-                //  2) 音频位置 <2s 说明它根本没真正开走，此时 seek 只会回跳到开头形成死循环。
-                // 硬重同步已关闭（v2.4.12）：实测它会与卡顿保护互相激化成「回跳开头」死循环。
-                // 现在大偏差只记录 + 重置滤波器，不再 seek；同步交给双向卡顿保护兜。
-                // 只有音频回调是新鲜的（<2s）才允许纠偏：
-                // apos 陈旧或为 0 时算出的「几十秒偏差」会把视频疯狂跳帧（日志 -27~-31s 即此）。
-                const audioFresh = this._audioCbAt && (now - this._audioCbAt) < 2000;
-                if (this._audioSyncingPaused) {
-                  // 音频已刹住：用最后一次回调位置（外推时钟会继续涨，不能用来判据）
-                  const cbDrift = (this._audioCbPos || 0) - videoNow;
-                  this._driftEwma = 0;
-                  this._syncSampleCount = 0;
-                  if (cbDrift <= 0.12) this._unparkAudio('caught-up ' + cbDrift.toFixed(2) + 's');
-                } else if (audioFresh && rawDrift > 0.45) {
-                  // 音频明显跑前：直接刹住音频等视频，不再「狂跳帧追音频」（那是卡顿主因）
-                  console.warn('[Sync] audio ahead ' + rawDrift.toFixed(2) + 's -> park');
-                  this._parkAudio('ahead');
-                  this._driftEwma = 0;
-                  this._syncSampleCount = 0;
-                } else if (!audioFresh) {
-                  this._driftEwma = 0;
-                  this._syncSampleCount = 0;
-                } else if (Math.abs(rawDrift) > 1.0) {
-                  // 音频落后超过 1s（视频跑前）：无法快进音频，只能轻微刹车视频；
-                  // 负数大偏差时保持不动作，等视频自己消耗（旧版狂 adjust 反而抖）。
-                  this._driftEwma = 0;
-                  this._syncSampleCount = 0;
+              // ---- 放行判定：必须独立于「音频回调新鲜 / 音频卡顿」这两个门 ----
+              // 旧实现把放行关在新鲜度门里，音频一旦被 park 超过 2s 门就永久关闭，
+              // 实测静音播放 16s、apos 冻在 18.0s 而 pos 跑到 33.8s。
+              // 现在音频永不 pause（《视频播放器完全指南》§3：音频设备就是主时钟），
+              // 定住的是视频，「能不能放行」只看音频是否已追平。
+              if (this._videoBraking) {
+                if (rawDrift >= -0.10) {
+                  this._unbrakeVideo('caught-up ' + rawDrift.toFixed(2) + 's');
+                } else if (now - (this._videoBrakeAt || 0) > 3000) {
+                  this._unbrakeVideo('timeout');
+                }
+              } else if (!(audioFresh && !audioStalled && audioElapsed < 2.5)) {
+                this._driftEwma = 0;
+                this._syncSampleCount = 0;
+              } else if (rawDrift < -1.20) {
+                // 视频明显超前（>1.2s）：定住画面等音频追上来，最长 3s 兜底放行，
+                // 避免弱网下画面长时间定格。绝不 pause 音频。
+                console.warn('[Sync] video ahead ' + (-rawDrift).toFixed(2) + 's -> brake');
+                this._brakeVideo('ahead');
+                this._driftEwma = 0;
+                this._syncSampleCount = 0;
+              } else if (rawDrift > 0.60 && videoMoving) {
+                // 视频落后：跳帧追赶（音频无法安全快进，只动视频）。步长限幅，
+                // 每 500ms 一次避免大跳；视频本身在卡（videoMoving=false）时不追。
+                const step = Math.min(Math.max(rawDrift * 0.5, 0.05), 0.60);
+                try {
+                  this.rgav.adjust(step);
+                  console.warn('[Sync] catch-up video: drift=' + rawDrift.toFixed(2) + 's adj=' + step.toFixed(2) + 's');
+                  this._lastAdjustAt = now;
+                } catch (e) {
+                  console.warn('[Sync] adjust error: ' + e);
+                }
+                this._driftEwma = 0;
+                this._syncSampleCount = 0;
+              } else if (Math.abs(rawDrift) > 1.0) {
+                // 视频超前 1.0~1.2s，或视频落后但没在推进：不动，等它自己收敛。
+                this._driftEwma = 0;
+                this._syncSampleCount = 0;
+              } else {
+                this._hardResyncStrikes = 0;
+                // EWMA 低通滤波平滑单核调度偶发抖动
+                if (this._driftEwma === 0 || this._driftEwma === undefined) {
+                  this._driftEwma = rawDrift;
                 } else {
-                  this._hardResyncStrikes = 0;
-                  // EWMA 低通滤波平滑单核调度偶发抖动 (0.75 惯性 + 0.25 采样，有效滤除 60ms 锯齿波)
-                  if (this._driftEwma === 0 || this._driftEwma === undefined) {
-                    this._driftEwma = rawDrift;
-                  } else {
-                    this._driftEwma = this._driftEwma * 0.5 + rawDrift * 0.5;
-                  }
-                  this._syncSampleCount = (this._syncSampleCount || 0) + 1;
-
-                  // 至少累积 3 次采样（约 1.5s）后再做决策，防止起播偶发瞬态误调
-                  if (this._syncSampleCount >= 3) {
-                    const elapsedSinceAdjust = now - (this._lastAdjustAt || 0);
-                    // 冷却：小偏差 1000ms；大偏差 700ms（要追 1s 以上不能等）
-                    const cooldownMs = Math.abs(this._driftEwma) > 0.5 ? 700 : 1000;
-                    if (elapsedSinceAdjust >= cooldownMs) {
-                      // 对称死区 ±45ms：时钟估计精度提升到 ~50ms 后，旧的非对称死区（+90/−180ms）
-                      // 已经把两个方向都放成了死区，负向更是完全不动（见下一处注释）。
-                      if (this._driftEwma > 0.045) {
-                        // 视频滞后音频 > 90ms: 温和追赶，比例调节 min(max(ewma*0.5, 30ms), 50ms)
-                        // 与 native 300ms 环形缓冲溢出丢帧串联互补：90ms~300ms 由控制器主动拉回，杜绝无干预空档
-                        // 小偏差温和（≤50ms）；大偏差放大步长快速收敛（视频落后→跳帧，安全上限 400ms）
-                        const mag = this._driftEwma;
-                        const delta = Math.min(Math.max(mag * 0.5, 0.030), mag > 0.5 ? 0.400 : 0.050);
-                        try {
-                          this.rgav.adjust(delta);
-                          console.warn('[Sync] dynamic adjust (catch-up): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
-                          this._lastAdjustAt = now;
-                          this._driftEwma = 0;
-                        } catch (e) {
-                          console.warn('[Sync] adjust error: ' + e);
-                        }
-                      } else if (this._driftEwma < -0.045) {
-                        // 视频超前音频 > 180ms（超出人类视听感知极限 +185ms 时微量刹车）
-                        // 注意：旧值 -0.020 在 native 侧是空操作（判定是 d < -0.02，等于没生效），
-                        // 所以「刹车」从来没真正执行过。改为 -0.030（一次 30ms 的轻微等待，不会定格）。
-                        // 负向是「等一等」（native 侧 t0 += |d|，会造成最多一次 |d| 的停顿），
-                        // 所以上限压到 120ms，避免大偏差时出现肉眼可见定格。
-                        const magN = -this._driftEwma;
-                        const delta = -Math.min(Math.max(magN * 0.5, 0.030), magN > 0.5 ? 0.120 : 0.050);
-                        try {
-                          this.rgav.adjust(delta);
-                          console.warn('[Sync] dynamic adjust (lead-brake): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
-                          this._lastAdjustAt = now;
-                          this._driftEwma = 0;
-                        } catch (e) {
-                          console.warn('[Sync] adjust error: ' + e);
-                        }
+                  this._driftEwma = this._driftEwma * 0.5 + rawDrift * 0.5;
+                }
+                this._syncSampleCount = (this._syncSampleCount || 0) + 1;
+                // 至少累积 3 次采样（约 1.5s）后再做决策，防止起播偶发瞬态误调
+                if (this._syncSampleCount >= 3) {
+                  const elapsedSinceAdjust = now - (this._lastAdjustAt || 0);
+                  const cooldownMs = Math.abs(this._driftEwma) > 0.5 ? 700 : 1000;
+                  if (elapsedSinceAdjust >= cooldownMs) {
+                    if (this._driftEwma > 0.045) {
+                      // 视频滞后音频：温和追赶（视频落后→跳帧，安全上限 400ms）
+                      const mag = this._driftEwma;
+                      const delta = Math.min(Math.max(mag * 0.5, 0.030), mag > 0.5 ? 0.400 : 0.050);
+                      try {
+                        this.rgav.adjust(delta);
+                        console.warn('[Sync] dynamic adjust (catch-up): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
+                        this._lastAdjustAt = now;
+                        this._driftEwma = 0;
+                      } catch (e) {
+                        console.warn('[Sync] adjust error: ' + e);
                       }
-                      // 注：-0.180s ~ +0.090s 属于感知与采样死区，完全不调用 adjust()，保持画面极致流畅！
+                    } else if (this._driftEwma < -0.045) {
+                      // 视频超前音频：负向 adjust 是让视频等一等（上限 120ms，避免肉眼定格）
+                      const magN = -this._driftEwma;
+                      const delta = -Math.min(Math.max(magN * 0.5, 0.030), magN > 0.5 ? 0.120 : 0.050);
+                      try {
+                        this.rgav.adjust(delta);
+                        console.warn('[Sync] dynamic adjust (lead-brake): drift=' + rawDrift.toFixed(3) + 's ewma=' + this._driftEwma.toFixed(3) + 's adj=' + delta.toFixed(3) + 's');
+                        this._lastAdjustAt = now;
+                        this._driftEwma = 0;
+                      } catch (e) {
+                        console.warn('[Sync] adjust error: ' + e);
+                      }
                     }
+                    // 注：-0.045s ~ +0.045s 属于感知与采样死区，完全不调用 adjust()，保持画面流畅
                   }
                 }
               }
@@ -2567,22 +2558,24 @@ var script = {
       if (!(elapsed >= 0) || elapsed > 60) return base;
       return base + elapsed;
     },
-    // 音频「点刹」：偏差大时把音频原地停住，让视频按 1x 追上来。
-    // 比原来的「狂跳帧追音频」对观感友好得多（弱网下后者会卡成幻灯片）。
-    _parkAudio(why) {
-      if (this._audioSyncingPaused) return;
-      this._audioSyncingPaused = true;
-      this._audioParkCbAt = Date.now();
-      try { if (this.audioPlayer && typeof this.audioPlayer.pause === 'function') this.audioPlayer.pause(); } catch (e) {}
-      console.warn('[Sync] park audio (' + why + ')');
+    // 视频「定住等音频」：音频设备就是主时钟（《视频播放器完全指南》§3），
+    // 音画对齐只允许动视频这一侧 —— 视频超前就定住画面等音频追上来，
+    // 音频任何情况下都不 pause（旧实现 pause 音频后放行判定被冻结门挡住 → 永久静音）。
+    _brakeVideo(why) {
+      if (this._videoBraking) return;
+      this._videoBraking = true;
+      this._videoBrakeAt = Date.now();
+      try { if (this.rgav && typeof this.rgav.pause === 'function') this.rgav.pause(); } catch (e) {}
+      console.warn('[Sync] brake video (' + why + ')');
     },
-    _unparkAudio(why) {
-      if (!this._audioSyncingPaused) return;
-      this._audioSyncingPaused = false;
-      try { if (this.audioPlayer && typeof this.audioPlayer.resume === 'function') this.audioPlayer.resume(); } catch (e) {}
+    _unbrakeVideo(why) {
+      if (!this._videoBraking) return;
+      this._videoBraking = false;
+      try { if (this.rgav && typeof this.rgav.unpause === 'function') this.rgav.unpause(); } catch (e) {}
       this._lastAudioNow = 0;
       this._lastAudioNowAt = 0;
-      console.warn('[Sync] unpark audio (' + why + ')');
+      this._bufLastAt = Date.now();
+      console.warn('[Sync] unbrake video (' + why + ')');
     },
     _syncResume(gen, why, offset) {
       if (gen !== this.playGen || this._syncDone || this.isStopping) return;
@@ -2684,7 +2677,7 @@ var script = {
       this._audioPrewarm = false;
       this._audioParked = false;
       this._audioParkAt = 0;
-      this._audioSyncingPaused = false;
+      this._videoBraking = false;
       this._audioPos = 0;
       this._audioPosAt = 0;
       this._lastTrackedAudioPos = null;
@@ -3216,7 +3209,7 @@ var script = {
       this._audioPrewarm = false;
       this._audioParked = false;
       this._audioParkAt = 0;
-      this._audioSyncingPaused = false;
+      this._videoBraking = false;
       this._startedAt = Date.now();
       this._lastAudioNow = 0;
       this._lastAudioNowAt = 0;
